@@ -58,7 +58,7 @@ def load_hf_episodes(repo_id: str, num_episodes: int, seed: int):
     episode_indices = sorted(set(row["episode_index"] for row in ds))
     rng = np.random.RandomState(seed)
     chosen = sorted(rng.choice(episode_indices, size=min(num_episodes, len(episode_indices)), replace=False))
-    logger.info("Chose %d episodes from HF dataset: %s", len(chosen), chosen.tolist())
+    logger.info("Chose %d episodes from HF dataset: %s", len(chosen), list(chosen))
 
     episodes = {}
     for ep_idx in chosen:
