@@ -127,20 +127,19 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
-def _patch_image_transform(dataset: lerobot_dataset.LeRobotDataset, meta: lerobot_dataset.LeRobotDatasetMetadata) -> None:
-    """Patch the HF dataset transform to decode image columns stored as {bytes, path} structs."""
-    import io
-    from PIL import Image
-    from torchvision import transforms as tv_transforms
+class _ImageDecodingTransform:
+    """Picklable transform that decodes image columns stored as {bytes, path} structs."""
 
-    image_keys = [k for k, v in meta.info.get("features", {}).items() if v.get("dtype") == "image"]
-    if not image_keys:
-        return
+    def __init__(self, image_keys: list[str]):
+        self.image_keys = image_keys
 
-    to_tensor = tv_transforms.ToTensor()
+    def __call__(self, items_dict):
+        import io
+        from PIL import Image
+        from torchvision import transforms as tv_transforms
 
-    def patched_transform(items_dict):
-        for key in image_keys:
+        to_tensor = tv_transforms.ToTensor()
+        for key in self.image_keys:
             if key in items_dict:
                 decoded = []
                 for item in items_dict[key]:
@@ -152,13 +151,19 @@ def _patch_image_transform(dataset: lerobot_dataset.LeRobotDataset, meta: lerobo
                         decoded.append(item)
                 items_dict[key] = decoded
         for key in items_dict:
-            if key not in image_keys:
+            if key not in self.image_keys:
                 first = items_dict[key][0]
                 if first is not None and not isinstance(first, str):
                     items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
         return items_dict
 
-    dataset.hf_dataset.set_transform(patched_transform)
+
+def _patch_image_transform(dataset: lerobot_dataset.LeRobotDataset, meta: lerobot_dataset.LeRobotDatasetMetadata) -> None:
+    """Patch the HF dataset transform to decode image columns stored as {bytes, path} structs."""
+    image_keys = [k for k, v in meta.info.get("features", {}).items() if v.get("dtype") == "image"]
+    if not image_keys:
+        return
+    dataset.hf_dataset.set_transform(_ImageDecodingTransform(image_keys))
 
 
 def create_torch_dataset(
