@@ -137,7 +137,6 @@ def _patch_image_transform(dataset: lerobot_dataset.LeRobotDataset, meta: lerobo
     if not image_keys:
         return
 
-    original_transform = dataset.hf_dataset.transform
     to_tensor = tv_transforms.ToTensor()
 
     def patched_transform(items_dict):
@@ -146,11 +145,18 @@ def _patch_image_transform(dataset: lerobot_dataset.LeRobotDataset, meta: lerobo
                 decoded = []
                 for item in items_dict[key]:
                     if isinstance(item, dict) and "bytes" in item and item["bytes"] is not None:
-                        decoded.append(Image.open(io.BytesIO(item["bytes"])).convert("RGB"))
+                        decoded.append(to_tensor(Image.open(io.BytesIO(item["bytes"])).convert("RGB")))
+                    elif isinstance(item, Image.Image):
+                        decoded.append(to_tensor(item))
                     else:
                         decoded.append(item)
                 items_dict[key] = decoded
-        return original_transform(items_dict)
+        for key in items_dict:
+            if key not in image_keys:
+                first = items_dict[key][0]
+                if first is not None and not isinstance(first, str):
+                    items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
+        return items_dict
 
     dataset.hf_dataset.set_transform(patched_transform)
 
