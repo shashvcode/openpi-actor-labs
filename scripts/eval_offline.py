@@ -80,6 +80,7 @@ def load_hf_episodes(repo_id: str, num_episodes: int, seed: int):
 def load_s3_episodes(num_episodes: int, seed: int):
     """Load held-out episodes from S3 nojoint_parquet (not used in training)."""
     import boto3
+    import pyarrow as pa
     import pyarrow.parquet as pq
 
     env_path = pathlib.Path(__file__).parent.parent / ".env"
