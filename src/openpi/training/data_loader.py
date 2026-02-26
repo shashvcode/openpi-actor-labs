@@ -127,6 +127,34 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _patch_image_transform(dataset: lerobot_dataset.LeRobotDataset, meta: lerobot_dataset.LeRobotDatasetMetadata) -> None:
+    """Patch the HF dataset transform to decode image columns stored as {bytes, path} structs."""
+    import io
+    from PIL import Image
+    from torchvision import transforms as tv_transforms
+
+    image_keys = [k for k, v in meta.info.get("features", {}).items() if v.get("dtype") == "image"]
+    if not image_keys:
+        return
+
+    original_transform = dataset.hf_dataset.transform
+    to_tensor = tv_transforms.ToTensor()
+
+    def patched_transform(items_dict):
+        for key in image_keys:
+            if key in items_dict:
+                decoded = []
+                for item in items_dict[key]:
+                    if isinstance(item, dict) and "bytes" in item and item["bytes"] is not None:
+                        decoded.append(Image.open(io.BytesIO(item["bytes"])).convert("RGB"))
+                    else:
+                        decoded.append(item)
+                items_dict[key] = decoded
+        return original_transform(items_dict)
+
+    dataset.hf_dataset.set_transform(patched_transform)
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -144,6 +172,8 @@ def create_torch_dataset(
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+
+    _patch_image_transform(dataset, dataset_meta)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
