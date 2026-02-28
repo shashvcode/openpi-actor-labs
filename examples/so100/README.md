@@ -156,15 +156,6 @@ The model config (`action_dim` in `TrainConfig`) must match this dimensionality.
 - Any number of cameras works. Each gets its own `observation.images.<name>` column.
 - Resolution at capture doesn't matter much -- the model resizes to 224x224 internally. We capture at 640x480 to keep file sizes reasonable.
 - Use RGB format (convert from BGR if using OpenCV).
-- Images are stored as JPEG bytes inside the parquet file. JPEG quality 50-70 is fine -- it saves disk space and the 224x224 resize during training dominates quality anyway.
+- Images are stored as JPEG bytes inside the parquet file. JPEG quality 75-8 is fine -- it saves disk space and the 224x224 resize during training dominates quality anyway.
 
 ---
-
-## Tips for Good Data
-
-1. **50-150 episodes** is enough for LoRA fine-tuning on a single task.
-2. **Vary starting positions** -- don't always place objects in the exact same spot.
-3. **Include recovery** -- if you make a mistake during teleoperation, correct it rather than restarting. The model learns from corrections.
-4. **Consistent task labels** -- use the exact same task string for all episodes of the same task.
-5. **10 Hz recording rate** matches the model's expected temporal resolution. Higher FPS wastes disk without helping.
-6. **Keep episodes under ~60 seconds** (600 frames). Longer episodes use more memory during training.

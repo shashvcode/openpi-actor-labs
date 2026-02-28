@@ -23,6 +23,7 @@ import argparse
 import logging
 import signal
 import sys
+import threading
 import time
 
 import cv2
@@ -102,7 +103,7 @@ class ArmController:
         from scservo_sdk import PortHandler, protocol_packet_handler
 
         self.port_handler = PortHandler(port)
-        self.packet_handler = protocol_packet_handler(self.port_handler, 0)
+        self.packet_handler = protocol_packet_handler()
         self.positions = {mid: float(SERVO_MID) for mid in ALL_IDS}
         self._last_sent_positions = {}
         self.torque_enabled = False
@@ -116,11 +117,11 @@ class ArmController:
         self.port_handler.setBaudRate(1_000_000)
 
         self.sync_writer = GroupSyncWrite(
-            self.packet_handler, ADDR_GOAL_POSITION, 2,
+            self.port_handler, self.packet_handler, ADDR_GOAL_POSITION, 2,
         )
 
         for name, mid in MOTOR_IDS.items():
-            _, comm, _ = self.packet_handler.ping(mid)
+            _, comm, _ = self.packet_handler.ping(self.port_handler, mid)
             if comm != COMM_SUCCESS:
                 raise RuntimeError(f"Motor {mid} ({name}) not responding!")
             logger.info("Motor %d (%s) OK", mid, name)
@@ -134,31 +135,32 @@ class ArmController:
         from scservo_sdk import COMM_SUCCESS
 
         for mid in ALL_IDS:
-            data, result, _ = self.packet_handler.readTxRx(mid, ADDR_PRESENT_POSITION, 2)
+            data, result, _ = self.packet_handler.readTxRx(self.port_handler, mid, ADDR_PRESENT_POSITION, 2)
             if result == COMM_SUCCESS:
                 self.positions[mid] = float(self._makeword(data[0], data[1]))
 
     def _configure_servos(self):
         ph = self.packet_handler
+        port = self.port_handler
         for mid in ALL_IDS:
-            ph.write1ByteTxRx(mid, ADDR_LOCK, 0)
-            ph.write1ByteTxRx(mid, ADDR_OPERATING_MODE, 0)
-            ph.write1ByteTxRx(mid, ADDR_P_COEFFICIENT, 10)
-            ph.write1ByteTxRx(mid, ADDR_I_COEFFICIENT, 0)
-            ph.write1ByteTxRx(mid, ADDR_D_COEFFICIENT, 20)
-            ph.write2ByteTxRx(mid, ADDR_MAX_TORQUE_LIMIT, TORQUE_LIMITS[mid])
-            ph.write2ByteTxRx(mid, ADDR_PROTECTION_CURRENT, CURRENT_LIMITS[mid])
-            ph.write1ByteTxRx(mid, ADDR_OVERLOAD_TORQUE, 30)
-            ph.write1ByteTxRx(mid, ADDR_LOCK, 1)
+            ph.write1ByteTxRx(port, mid, ADDR_LOCK, 0)
+            ph.write1ByteTxRx(port, mid, ADDR_OPERATING_MODE, 0)
+            ph.write1ByteTxRx(port, mid, ADDR_P_COEFFICIENT, 10)
+            ph.write1ByteTxRx(port, mid, ADDR_I_COEFFICIENT, 0)
+            ph.write1ByteTxRx(port, mid, ADDR_D_COEFFICIENT, 20)
+            ph.write2ByteTxRx(port, mid, ADDR_MAX_TORQUE_LIMIT, TORQUE_LIMITS[mid])
+            ph.write2ByteTxRx(port, mid, ADDR_PROTECTION_CURRENT, CURRENT_LIMITS[mid])
+            ph.write1ByteTxRx(port, mid, ADDR_OVERLOAD_TORQUE, 30)
+            ph.write1ByteTxRx(port, mid, ADDR_LOCK, 1)
 
     def _enable_torque(self):
         for mid in ALL_IDS:
-            self.packet_handler.write1ByteTxRx(mid, ADDR_TORQUE_ENABLE, 1)
+            self.packet_handler.write1ByteTxRx(self.port_handler, mid, ADDR_TORQUE_ENABLE, 1)
         self.torque_enabled = True
 
     def disable_torque(self):
         for mid in ALL_IDS:
-            self.packet_handler.write1ByteTxRx(mid, ADDR_TORQUE_ENABLE, 0)
+            self.packet_handler.write1ByteTxRx(self.port_handler, mid, ADDR_TORQUE_ENABLE, 0)
         self.torque_enabled = False
         logger.info("Torque disabled — arm is free.")
 
@@ -215,6 +217,35 @@ def grab_frame(cap: cv2.VideoCapture) -> np.ndarray | None:
 
 
 # ---------------------------------------------------------------------------
+# Action smoothing — dead-zone, EMA, and hold counter
+# ---------------------------------------------------------------------------
+class ActionSmoother:
+    def __init__(self, num_axes: int = 6, alpha: float = 0.4,
+                 dead_zone: float = 0.05, hold_frames: int = 3):
+        self.alpha = alpha
+        self.dead_zone = dead_zone
+        self.hold_frames = hold_frames
+        self.smoothed = np.zeros(num_axes, dtype=np.float64)
+        self.near_zero_count = np.zeros(num_axes, dtype=np.int32)
+
+    def __call__(self, raw: np.ndarray) -> np.ndarray:
+        out = np.array(raw, dtype=np.float64)
+
+        for i in range(len(out)):
+            if abs(out[i]) < self.dead_zone:
+                self.near_zero_count[i] += 1
+                if self.near_zero_count[i] >= self.hold_frames:
+                    out[i] = 0.0
+                else:
+                    out[i] = self.smoothed[i]
+            else:
+                self.near_zero_count[i] = 0
+
+        self.smoothed = self.alpha * out + (1.0 - self.alpha) * self.smoothed
+        return self.smoothed.copy()
+
+
+# ---------------------------------------------------------------------------
 # Joystick-to-servo mapping (from control.md Section 9)
 # ---------------------------------------------------------------------------
 def apply_joystick_to_arm(arm: ArmController, joystick: np.ndarray, dt: float, speed: float):
@@ -229,7 +260,6 @@ def apply_joystick_to_arm(arm: ArmController, joystick: np.ndarray, dt: float, s
     arm.move(MOTOR_IDS["shoulder_lift"], -ry * scale)
     arm.move(MOTOR_IDS["wrist_flex"], rx * scale)
 
-    # L2/R2 triggers control the gripper
     gripper_speed = scale * 0.5
     if l2 > 0.05:
         arm.move(MOTOR_IDS["gripper"], -l2 * gripper_speed)
@@ -242,41 +272,100 @@ def apply_joystick_to_arm(arm: ArmController, joystick: np.ndarray, dt: float, s
 # ---------------------------------------------------------------------------
 # Main control loop
 # ---------------------------------------------------------------------------
-def run(args):
+def _setup_common(args):
+    """Shared setup for both sync and async modes."""
     from openpi_client import websocket_client_policy as wcp
 
-    # Connect to policy server
     port = args.port if not args.host.startswith("ws") else None
     logger.info("Connecting to policy server at %s ...", args.host)
     policy = wcp.WebsocketClientPolicy(host=args.host, port=port)
     metadata = policy.get_server_metadata()
     logger.info("Server metadata: %s", metadata)
 
-    # Open cameras
     scene_cap = open_camera(args.scene_cam, "scene")
     wrist_cap = open_camera(args.wrist_cam, "wrist")
 
-    # Connect to arm (unless dry run)
     arm = None
     if not args.dry_run:
         arm = ArmController(args.arm_port)
         arm.connect()
 
-    # State tracks the last joystick values fed to the model
+    smoother = ActionSmoother(
+        num_axes=6,
+        alpha=args.smoothing,
+        dead_zone=args.dead_zone,
+        hold_frames=args.hold_frames,
+    )
+    logger.info(
+        "Smoother: alpha=%.2f, dead_zone=%.3f, hold_frames=%d",
+        args.smoothing, args.dead_zone, args.hold_frames,
+    )
+
+    return policy, scene_cap, wrist_cap, arm, smoother
+
+
+def _build_obs(state, scene_frame, wrist_frame, prompt):
+    return {
+        "observation/state": state.copy(),
+        "observation/image_scene": scene_frame,
+        "observation/image_wrist": wrist_frame,
+        "prompt": prompt,
+    }
+
+
+def run_async(args):
+    """Async mode: inference runs in background, arm never stops."""
+    policy, scene_cap, wrist_cap, arm, smoother = _setup_common(args)
+
     state = np.zeros(6, dtype=np.float32)
     step = 0
     target_dt = 1.0 / CONTROL_HZ
+    hold_count = 0
 
-    # Graceful shutdown on Ctrl+C
     shutdown = False
-
     def on_signal(_sig, _frame):
         nonlocal shutdown
         shutdown = True
-
     signal.signal(signal.SIGINT, on_signal)
 
-    logger.info("Starting control loop at %d Hz (Ctrl+C to stop) ...", CONTROL_HZ)
+    # Async inference state
+    result_lock = threading.Lock()
+    next_actions = None
+    infering = False
+
+    def do_infer(obs):
+        nonlocal next_actions, infering
+        try:
+            result = policy.infer(obs)
+            with result_lock:
+                next_actions = result["actions"]
+        except Exception as e:
+            logger.error("Inference error: %s", e)
+        finally:
+            with result_lock:
+                infering = False
+
+    # First inference is synchronous (JIT compilation wait)
+    logger.info("First inference (may take 1-2 min for JIT compilation)...")
+    scene_frame = grab_frame(scene_cap)
+    wrist_frame = grab_frame(wrist_cap)
+    while scene_frame is None or wrist_frame is None:
+        time.sleep(0.01)
+        scene_frame = grab_frame(scene_cap)
+        wrist_frame = grab_frame(wrist_cap)
+
+    obs = _build_obs(state, scene_frame, wrist_frame, args.prompt)
+    first_start = time.perf_counter()
+    result = policy.infer(obs)
+    logger.info("First inference done in %.1fs", time.perf_counter() - first_start)
+
+    current_actions = result["actions"]
+    action_idx = 0
+    hold_action = np.zeros(6, dtype=np.float32)
+
+    logger.info(
+        "Starting ASYNC control loop at %d Hz (Ctrl+C to stop) ...", CONTROL_HZ,
+    )
 
     try:
         while not shutdown:
@@ -284,9 +373,104 @@ def run(args):
                 logger.info("Reached max steps (%d). Stopping.", args.max_steps)
                 break
 
-            loop_start = time.perf_counter()
+            tick_start = time.perf_counter()
 
-            # 1. Capture camera frames
+            # Pick action: from chunk, from new inference result, or hold
+            is_hold = False
+            if action_idx < len(current_actions):
+                raw_action = current_actions[action_idx]
+                action_idx += 1
+                hold_action = np.array(raw_action, dtype=np.float32)
+                hold_count = 0
+            else:
+                with result_lock:
+                    if next_actions is not None:
+                        current_actions = next_actions
+                        next_actions = None
+                        action_idx = 1
+                        raw_action = current_actions[0]
+                        hold_action = np.array(raw_action, dtype=np.float32)
+                        hold_count = 0
+                    else:
+                        raw_action = hold_action
+                        is_hold = True
+                        hold_count += 1
+
+            action = smoother(raw_action)
+
+            if args.dry_run:
+                if step % 10 == 0:
+                    tag = "HOLD" if is_hold else "act"
+                    logger.info(
+                        "Step %d [%s] raw:[%s] smooth:[%s]",
+                        step, tag,
+                        ", ".join(f"{v:+.3f}" for v in raw_action),
+                        ", ".join(f"{v:+.3f}" for v in action),
+                    )
+            else:
+                apply_joystick_to_arm(arm, action, target_dt, args.speed)
+
+            state = np.array(raw_action, dtype=np.float32)
+            step += 1
+
+            if step % 30 == 0:
+                tag = f"hold={hold_count}" if is_hold else "chunk"
+                logger.info(
+                    "Step %d | %s | raw:[%s]",
+                    step, tag,
+                    ", ".join(f"{v:+.3f}" for v in raw_action),
+                )
+
+            # Kick off next inference if idle
+            with result_lock:
+                should_infer = not infering
+            if should_infer:
+                scene_frame = grab_frame(scene_cap)
+                wrist_frame = grab_frame(wrist_cap)
+                if scene_frame is not None and wrist_frame is not None:
+                    obs = _build_obs(state, scene_frame, wrist_frame, args.prompt)
+                    with result_lock:
+                        infering = True
+                    threading.Thread(
+                        target=do_infer, args=(obs,), daemon=True,
+                    ).start()
+
+            elapsed = time.perf_counter() - tick_start
+            sleep_time = target_dt - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    finally:
+        logger.info("Shutting down...")
+        scene_cap.release()
+        wrist_cap.release()
+        if arm is not None:
+            arm.close()
+        logger.info("Done. Executed %d steps (%d hold frames).", step, hold_count)
+
+
+def run_sync(args):
+    """Original synchronous mode: query model, execute chunk, repeat."""
+    policy, scene_cap, wrist_cap, arm, smoother = _setup_common(args)
+
+    state = np.zeros(6, dtype=np.float32)
+    step = 0
+    target_dt = 1.0 / CONTROL_HZ
+
+    shutdown = False
+    def on_signal(_sig, _frame):
+        nonlocal shutdown
+        shutdown = True
+    signal.signal(signal.SIGINT, on_signal)
+
+    logger.info("Starting SYNC control loop at %d Hz (Ctrl+C to stop) ...", CONTROL_HZ)
+
+    try:
+        while not shutdown:
+            if args.max_steps and step >= args.max_steps:
+                logger.info("Reached max steps (%d). Stopping.", args.max_steps)
+                break
+
             scene_frame = grab_frame(scene_cap)
             wrist_frame = grab_frame(wrist_cap)
             if scene_frame is None or wrist_frame is None:
@@ -294,52 +478,44 @@ def run(args):
                 time.sleep(0.01)
                 continue
 
-            # 2. Build observation
-            obs = {
-                "observation/state": state.copy(),
-                "observation/image_scene": scene_frame,
-                "observation/image_wrist": wrist_frame,
-                "prompt": args.prompt,
-            }
+            obs = _build_obs(state, scene_frame, wrist_frame, args.prompt)
 
-            # 3. Query model
             infer_start = time.perf_counter()
             result = policy.infer(obs)
             infer_ms = (time.perf_counter() - infer_start) * 1000
-            actions = result["actions"]  # shape (action_horizon, 6)
+            actions = result["actions"]
 
             if step % 10 == 0:
                 logger.info(
-                    "Step %d | infer %.0fms | action[0]: [%s]",
+                    "Step %d | infer %.0fms | raw[0]: [%s]",
                     step, infer_ms,
                     ", ".join(f"{v:+.3f}" for v in actions[0]),
                 )
 
-            # 4. Execute action chunk
             for action_idx in range(len(actions)):
                 if shutdown:
                     break
 
-                action = actions[action_idx]
+                raw_action = actions[action_idx]
+                action = smoother(raw_action)
                 action_start = time.perf_counter()
 
                 if args.dry_run:
                     if action_idx == 0:
                         logger.info(
-                            "  [dry-run] action[%d]: [%s]",
-                            action_idx,
+                            "  [dry-run] raw:[%s] smooth:[%s]",
+                            ", ".join(f"{v:+.3f}" for v in raw_action),
                             ", ".join(f"{v:+.3f}" for v in action),
                         )
                 else:
                     apply_joystick_to_arm(arm, action, target_dt, args.speed)
 
-                state = np.array(action, dtype=np.float32)
+                state = np.array(raw_action, dtype=np.float32)
                 step += 1
 
                 if args.max_steps and step >= args.max_steps:
                     break
 
-                # Pace to target rate
                 elapsed = time.perf_counter() - action_start
                 sleep_time = target_dt - elapsed
                 if sleep_time > 0:
@@ -369,8 +545,19 @@ def main():
     parser.add_argument("--max-steps", type=int, default=None, help="Max steps before stopping")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print predicted actions without sending to servos")
+    parser.add_argument("--smoothing", type=float, default=0.4,
+                        help="EMA alpha (0=max smooth, 1=no smoothing)")
+    parser.add_argument("--dead-zone", type=float, default=0.05,
+                        help="Values below this snap to zero")
+    parser.add_argument("--hold-frames", type=int, default=3,
+                        help="Consecutive near-zero frames before accepting stop")
+    parser.add_argument("--sync", action="store_true",
+                        help="Use old synchronous mode (arm freezes during inference)")
     args = parser.parse_args()
-    run(args)
+    if args.sync:
+        run_sync(args)
+    else:
+        run_async(args)
 
 
 if __name__ == "__main__":
