@@ -76,7 +76,7 @@ SERVO_MID = 2048
 # Control loop parameters
 SPEED = 15.0
 MAX_DT = 0.05
-CONTROL_HZ = 10  # matches training FPS
+CONTROL_HZ = 30  # matches training FPS (v2: 30 Hz)
 
 # Camera
 IMG_W, IMG_H = 640, 480
@@ -86,11 +86,23 @@ IMG_W, IMG_H = 640, 480
 # ArmController
 # ---------------------------------------------------------------------------
 class ArmController:
+    @staticmethod
+    def _lobyte(w):
+        return w & 0xFF
+
+    @staticmethod
+    def _hibyte(w):
+        return (w >> 8) & 0xFF
+
+    @staticmethod
+    def _makeword(lo, hi):
+        return (lo & 0xFF) | ((hi & 0xFF) << 8)
+
     def __init__(self, port: str):
-        from scservo_sdk import GroupSyncWrite, PacketHandler, PortHandler
+        from scservo_sdk import PortHandler, protocol_packet_handler
 
         self.port_handler = PortHandler(port)
-        self.packet_handler = PacketHandler(0)
+        self.packet_handler = protocol_packet_handler(self.port_handler, 0)
         self.positions = {mid: float(SERVO_MID) for mid in ALL_IDS}
         self._last_sent_positions = {}
         self.torque_enabled = False
@@ -104,11 +116,11 @@ class ArmController:
         self.port_handler.setBaudRate(1_000_000)
 
         self.sync_writer = GroupSyncWrite(
-            self.port_handler, self.packet_handler, ADDR_GOAL_POSITION, 2,
+            self.packet_handler, ADDR_GOAL_POSITION, 2,
         )
 
         for name, mid in MOTOR_IDS.items():
-            _, comm, _ = self.packet_handler.ping(self.port_handler, mid)
+            _, comm, _ = self.packet_handler.ping(mid)
             if comm != COMM_SUCCESS:
                 raise RuntimeError(f"Motor {mid} ({name}) not responding!")
             logger.info("Motor %d (%s) OK", mid, name)
@@ -119,37 +131,34 @@ class ArmController:
         logger.info("Arm connected. Positions: %s", {m: int(p) for m, p in self.positions.items()})
 
     def _read_positions(self):
-        from scservo_sdk import COMM_SUCCESS, SCS_MAKEWORD
+        from scservo_sdk import COMM_SUCCESS
 
         for mid in ALL_IDS:
-            data, result, _ = self.packet_handler.readTxRx(
-                self.port_handler, mid, ADDR_PRESENT_POSITION, 2,
-            )
+            data, result, _ = self.packet_handler.readTxRx(mid, ADDR_PRESENT_POSITION, 2)
             if result == COMM_SUCCESS:
-                self.positions[mid] = float(SCS_MAKEWORD(data[0], data[1]))
+                self.positions[mid] = float(self._makeword(data[0], data[1]))
 
     def _configure_servos(self):
         ph = self.packet_handler
-        port = self.port_handler
         for mid in ALL_IDS:
-            ph.write1ByteTxRx(port, mid, ADDR_LOCK, 0)
-            ph.write1ByteTxRx(port, mid, ADDR_OPERATING_MODE, 0)
-            ph.write1ByteTxRx(port, mid, ADDR_P_COEFFICIENT, 10)
-            ph.write1ByteTxRx(port, mid, ADDR_I_COEFFICIENT, 0)
-            ph.write1ByteTxRx(port, mid, ADDR_D_COEFFICIENT, 20)
-            ph.write2ByteTxRx(port, mid, ADDR_MAX_TORQUE_LIMIT, TORQUE_LIMITS[mid])
-            ph.write2ByteTxRx(port, mid, ADDR_PROTECTION_CURRENT, CURRENT_LIMITS[mid])
-            ph.write1ByteTxRx(port, mid, ADDR_OVERLOAD_TORQUE, 30)
-            ph.write1ByteTxRx(port, mid, ADDR_LOCK, 1)
+            ph.write1ByteTxRx(mid, ADDR_LOCK, 0)
+            ph.write1ByteTxRx(mid, ADDR_OPERATING_MODE, 0)
+            ph.write1ByteTxRx(mid, ADDR_P_COEFFICIENT, 10)
+            ph.write1ByteTxRx(mid, ADDR_I_COEFFICIENT, 0)
+            ph.write1ByteTxRx(mid, ADDR_D_COEFFICIENT, 20)
+            ph.write2ByteTxRx(mid, ADDR_MAX_TORQUE_LIMIT, TORQUE_LIMITS[mid])
+            ph.write2ByteTxRx(mid, ADDR_PROTECTION_CURRENT, CURRENT_LIMITS[mid])
+            ph.write1ByteTxRx(mid, ADDR_OVERLOAD_TORQUE, 30)
+            ph.write1ByteTxRx(mid, ADDR_LOCK, 1)
 
     def _enable_torque(self):
         for mid in ALL_IDS:
-            self.packet_handler.write1ByteTxRx(self.port_handler, mid, ADDR_TORQUE_ENABLE, 1)
+            self.packet_handler.write1ByteTxRx(mid, ADDR_TORQUE_ENABLE, 1)
         self.torque_enabled = True
 
     def disable_torque(self):
         for mid in ALL_IDS:
-            self.packet_handler.write1ByteTxRx(self.port_handler, mid, ADDR_TORQUE_ENABLE, 0)
+            self.packet_handler.write1ByteTxRx(mid, ADDR_TORQUE_ENABLE, 0)
         self.torque_enabled = False
         logger.info("Torque disabled — arm is free.")
 
@@ -160,8 +169,6 @@ class ArmController:
         self.positions[motor_id] = max(lo, min(hi, self.positions[motor_id] + delta))
 
     def send_positions(self):
-        from scservo_sdk import SCS_HIBYTE, SCS_LOBYTE
-
         if not self.torque_enabled or self.sync_writer is None:
             return
         int_pos = {mid: int(p) for mid, p in self.positions.items()}
@@ -172,7 +179,7 @@ class ArmController:
         self.sync_writer.clearParam()
         for mid in ALL_IDS:
             pos = int_pos[mid]
-            self.sync_writer.addParam(mid, [SCS_LOBYTE(pos), SCS_HIBYTE(pos)])
+            self.sync_writer.addParam(mid, [self._lobyte(pos), self._hibyte(pos)])
         self.sync_writer.txPacket()
         time.sleep(0.002)
 
@@ -239,8 +246,9 @@ def run(args):
     from openpi_client import websocket_client_policy as wcp
 
     # Connect to policy server
-    logger.info("Connecting to policy server at %s:%s ...", args.host, args.port)
-    policy = wcp.WebsocketClientPolicy(host=args.host, port=args.port)
+    port = args.port if not args.host.startswith("ws") else None
+    logger.info("Connecting to policy server at %s ...", args.host)
+    policy = wcp.WebsocketClientPolicy(host=args.host, port=port)
     metadata = policy.get_server_metadata()
     logger.info("Server metadata: %s", metadata)
 
