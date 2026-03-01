@@ -209,12 +209,13 @@ def main():
                         help="'hf' = training data (sanity check), 's3' = held-out data (generalization)")
     parser.add_argument("--num-episodes", type=int, default=10)
     parser.add_argument("--stride", type=int, default=5)
-    parser.add_argument("--repo-id", type=str, default="verm11/so100_joystick_pickup")
+    parser.add_argument("--repo-id", type=str, default="verm11/runA")
+    parser.add_argument("--config-name", type=str, default="pi05_so100_lora_v2")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     logger.info("Loading trained policy from %s...", args.checkpoint_dir)
-    train_config = _config.get_config("pi05_so100_lora")
+    train_config = _config.get_config(args.config_name)
     policy = _policy_config.create_trained_policy(train_config, args.checkpoint_dir)
 
     if args.source == "hf":
