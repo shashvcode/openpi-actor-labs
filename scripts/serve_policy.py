@@ -54,6 +54,9 @@ class Args:
     # Number of flow matching denoising steps (fewer = faster but noisier).
     num_steps: int | None = None
 
+    # Enable server-side depth estimation (adds scene depth as 3rd image for v4 configs).
+    depth: bool = False
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -108,6 +111,12 @@ def create_policy(args: Args) -> _policy.Policy:
 
 def main(args: Args) -> None:
     policy = create_policy(args)
+
+    if args.depth:
+        from openpi.policies.depth_augment import DepthAugmentedPolicy
+        logging.info("Wrapping policy with server-side depth estimation")
+        policy = DepthAugmentedPolicy(policy, device="cuda")
+
     policy_metadata = policy.metadata
 
     # Record the policy's behavior.
