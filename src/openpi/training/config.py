@@ -395,6 +395,43 @@ class LeRobotSO100DataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotSO100DepthDataConfig(DataConfigFactory):
+    """Config for SO-100 data with scene depth as the 3rd image input."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image_scene": "observation.images.scene",
+                        "observation/image_wrist": "observation.images.wrist",
+                        "observation/image_scene_depth": "observation.images.scene_depth",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[so100_policy.SO100DepthInputs(model_type=model_config.model_type)],
+            outputs=[so100_policy.SO100Outputs()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -1071,6 +1108,32 @@ _CONFIGS = [
         ema_decay=None,
         num_train_steps=10_000,
         save_interval=10_000,
+        keep_period=10_000,
+        batch_size=32,
+    ),
+    # v4: scene + wrist + scene_depth, action_horizon=11, 15K steps
+    TrainConfig(
+        name="pi05_so100_lora_v4",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=6,
+            action_horizon=11,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotSO100DepthDataConfig(
+            repo_id="verm11/runA",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=15_000,
+        save_interval=5_000,
         keep_period=10_000,
         batch_size=32,
     ),

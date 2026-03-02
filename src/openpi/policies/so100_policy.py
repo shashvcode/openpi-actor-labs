@@ -9,14 +9,17 @@ from openpi.models import model as _model
 ACTION_DIM = 6
 
 
-def make_so100_example() -> dict:
+def make_so100_example(use_depth: bool = False) -> dict:
     """Creates a random input example for the SO-100 joystick policy."""
-    return {
+    example = {
         "observation/state": np.random.uniform(-1, 1, size=(6,)).astype(np.float32),
         "observation/image_scene": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/image_wrist": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "prompt": "Pick up the bottle and place it on the yellow outlined square.",
     }
+    if use_depth:
+        example["observation/image_scene_depth"] = np.random.randint(256, size=(224, 224, 3), dtype=np.uint8)
+    return example
 
 
 def _parse_image(image) -> np.ndarray:
@@ -53,6 +56,44 @@ class SO100Inputs(transforms.DataTransformFn):
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
                 "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
+            },
+        }
+
+        if "actions" in data:
+            inputs["actions"] = data["actions"]
+
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class SO100DepthInputs(transforms.DataTransformFn):
+    """Maps SO-100 dataset fields to model input, using scene depth as the 3rd image."""
+
+    model_type: _model.ModelType
+
+    def __call__(self, data: dict) -> dict:
+        base_image = _parse_image(data["observation/image_scene"])
+        wrist_image = _parse_image(data["observation/image_wrist"])
+
+        if "observation/image_scene_depth" in data:
+            depth_image = _parse_image(data["observation/image_scene_depth"])
+        else:
+            depth_image = np.zeros_like(base_image)
+
+        inputs = {
+            "state": data["observation/state"],
+            "image": {
+                "base_0_rgb": base_image,
+                "left_wrist_0_rgb": wrist_image,
+                "right_wrist_0_rgb": depth_image,
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": np.True_,
             },
         }
 
