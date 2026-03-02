@@ -71,6 +71,7 @@ def load_hf_episodes(repo_id: str, num_episodes: int, seed: int):
             "task": "Pick up the bottle and place it on the yellow outlined square.",
             "image_scene_key": "observation.images.scene",
             "image_wrist_key": "observation.images.wrist",
+            "image_scene_depth_key": "observation.images.scene_depth",
             "state_key": "observation.state",
             "action_key": "action",
         }
@@ -155,12 +156,18 @@ def build_observation(frame: dict, meta: dict) -> dict:
     wrist_img = decode_image(frame[meta["image_wrist_key"]])
     state = np.array(frame[meta["state_key"]], dtype=np.float32)[:6]
 
-    return {
+    obs = {
         "observation/state": state,
         "observation/image_scene": scene_img,
         "observation/image_wrist": wrist_img,
         "prompt": meta["task"],
     }
+
+    depth_key = meta.get("image_scene_depth_key")
+    if depth_key and depth_key in frame:
+        obs["observation/image_scene_depth"] = decode_image(frame[depth_key])
+
+    return obs
 
 
 def evaluate_episode(policy, frames: list[dict], meta: dict, stride: int = 1) -> dict:
@@ -210,7 +217,7 @@ def main():
     parser.add_argument("--num-episodes", type=int, default=10)
     parser.add_argument("--stride", type=int, default=5)
     parser.add_argument("--repo-id", type=str, default="verm11/runA")
-    parser.add_argument("--config-name", type=str, default="pi05_so100_lora_v2")
+    parser.add_argument("--config-name", type=str, default="pi05_so100_lora_v4")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
