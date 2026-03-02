@@ -92,3 +92,62 @@ class DepthAugmentedPolicy(base_policy.BasePolicy):
                 scene = (scene * 255).astype(np.uint8)
             obs["observation/image_scene_depth"] = self._depth.estimate(scene)
         return self._inner.infer(obs)
+
+
+DEPTH_GRID_H, DEPTH_GRID_W = 4, 4
+
+
+class DepthGridAugmentedPolicy(base_policy.BasePolicy):
+    """Wraps a policy to compute a 4x4 depth grid and append it to the state vector.
+
+    At inference time, the client sends a 6-dim joystick state. This wrapper runs
+    DepthAnything on the scene image, extracts a 4x4 grid of metric depth values,
+    and concatenates them to produce a 22-dim state.
+    """
+
+    def __init__(self, inner_policy: base_policy.BasePolicy, device: str = "cuda"):
+        self._inner = inner_policy
+        self._depth = DepthEstimator(device=device)
+        self._depth.load()
+
+    @property
+    def metadata(self):
+        return self._inner.metadata
+
+    def _compute_grid(self, rgb: np.ndarray) -> np.ndarray:
+        """Run depth estimation and return a flat (16,) grid of metric depth values."""
+        from PIL import Image
+        import torch as _torch
+
+        pil_img = Image.fromarray(rgb)
+        inputs = self._depth.processor(images=pil_img, return_tensors="pt")
+        inputs = {k: v.to(self._depth.device) for k, v in inputs.items()}
+        if self._depth.device.type == "cuda":
+            inputs = {k: v.half() if v.dtype == _torch.float32 else v for k, v in inputs.items()}
+
+        with _torch.no_grad():
+            depth = self._depth.model(**inputs).predicted_depth.squeeze().float().cpu().numpy()
+
+        depth = np.clip(depth, self._depth.min_depth, self._depth.max_depth)
+
+        h, w = depth.shape
+        cell_h, cell_w = h // DEPTH_GRID_H, w // DEPTH_GRID_W
+        grid = np.zeros(DEPTH_GRID_H * DEPTH_GRID_W, dtype=np.float32)
+        for i in range(DEPTH_GRID_H):
+            for j in range(DEPTH_GRID_W):
+                cell = depth[i * cell_h : (i + 1) * cell_h, j * cell_w : (j + 1) * cell_w]
+                grid[i * DEPTH_GRID_W + j] = cell.mean()
+
+        return grid
+
+    def infer(self, obs: dict) -> dict:
+        if "observation/image_scene" in obs:
+            scene = np.asarray(obs["observation/image_scene"])
+            if scene.dtype != np.uint8:
+                scene = (scene * 255).astype(np.uint8)
+
+            depth_grid = self._compute_grid(scene)
+            state = np.asarray(obs.get("observation/state", np.zeros(6, dtype=np.float32)))
+            obs["observation/state"] = np.concatenate([state, depth_grid])
+
+        return self._inner.infer(obs)

@@ -134,7 +134,7 @@ class ModelTransformFactory(GroupFactory):
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
                         ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
+                        _transforms.PadStatesAndActions(model_config.action_dim, model_state_dim=model_config.state_dim),
                     ],
                 )
             case _model.ModelType.PI0_FAST:
@@ -417,6 +417,59 @@ class LeRobotSO100DepthDataConfig(DataConfigFactory):
 
         data_transforms = _transforms.Group(
             inputs=[so100_policy.SO100DepthInputs(model_type=model_config.model_type)],
+            outputs=[so100_policy.SO100Outputs()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSO100DepthGridDataConfig(DataConfigFactory):
+    """Config for SO-100 data with depth grid appended to state (22-dim: 6 joystick + 16 depth grid).
+
+    Uses only scene + wrist images (no depth image input). Depth grid values are loaded
+    from a precomputed numpy file and appended to the joystick state vector.
+    """
+
+    depth_grids_path: str = "depth_grids.npy"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        import numpy as np
+
+        depth_grids = None
+        grids_path = pathlib.Path(self.depth_grids_path)
+        if grids_path.exists():
+            depth_grids = np.load(grids_path)
+            logging.info("Loaded depth grids from %s — shape %s", grids_path, depth_grids.shape)
+        else:
+            logging.warning("Depth grids file not found at %s — using zeros", grids_path)
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image_scene": "observation.images.scene",
+                        "observation/image_wrist": "observation.images.wrist",
+                        "observation/state": "observation.state",
+                        "_index": "index",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[so100_policy.SO100DepthGridInputs(depth_grids=depth_grids)],
             outputs=[so100_policy.SO100Outputs()],
         )
 
@@ -1124,6 +1177,34 @@ _CONFIGS = [
         data=LeRobotSO100DepthDataConfig(
             repo_id="verm11/runA",
             base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=10_000,
+        batch_size=32,
+    ),
+    # v5: scene + wrist images only, depth grid in state (22-dim = 6 joystick + 16 depth)
+    TrainConfig(
+        name="pi05_so100_lora_v5",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=6,
+            state_dim=22,
+            action_horizon=11,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotSO100DepthGridDataConfig(
+            repo_id="verm11/runA",
+            base_config=DataConfig(prompt_from_task=True),
+            depth_grids_path="depth_grids.npy",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         freeze_filter=pi0_config.Pi0Config(

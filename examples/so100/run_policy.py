@@ -258,6 +258,17 @@ def apply_joystick_to_arm(arm: ArmController, joystick: np.ndarray, dt: float, s
 # ---------------------------------------------------------------------------
 # Main control loop
 # ---------------------------------------------------------------------------
+import threading
+
+
+def _infer_worker(policy, obs, result_holder, lock):
+    """Background thread: runs inference and stores result."""
+    result = policy.infer(obs)
+    with lock:
+        result_holder["actions"] = result["actions"]
+        result_holder["ready"] = True
+
+
 def run(args):
     from openpi_client import websocket_client_policy as wcp
 
@@ -285,40 +296,57 @@ def run(args):
         shutdown = True
     signal.signal(signal.SIGINT, on_signal)
 
-    logger.info("Starting control loop at %d Hz (Ctrl+C to stop) ...", CONTROL_HZ)
+    use_async = not args.sync
+    if use_async:
+        logger.info("Starting ASYNC control loop at %d Hz (Ctrl+C to stop) ...", CONTROL_HZ)
+    else:
+        logger.info("Starting SYNC control loop at %d Hz (Ctrl+C to stop) ...", CONTROL_HZ)
+
+    lock = threading.Lock()
+    next_result = {"actions": None, "ready": False}
+    bg_thread = None
 
     try:
+        # First inference is always synchronous (need initial actions)
+        scene_frame = grab_frame(scene_cap)
+        wrist_frame = grab_frame(wrist_cap)
+        obs = {
+            "observation/state": state.copy(),
+            "observation/image_scene": scene_frame,
+            "observation/image_wrist": wrist_frame,
+            "prompt": args.prompt,
+        }
+        infer_start = time.perf_counter()
+        result = policy.infer(obs)
+        infer_ms = (time.perf_counter() - infer_start) * 1000
+        actions = result["actions"]
+        logger.info("First inference: %.0fms, %d actions", infer_ms, len(actions))
+
         while not shutdown:
             if args.max_steps and step >= args.max_steps:
                 logger.info("Reached max steps (%d). Stopping.", args.max_steps)
                 break
 
-            scene_frame = grab_frame(scene_cap)
-            wrist_frame = grab_frame(wrist_cap)
-            if scene_frame is None or wrist_frame is None:
-                logger.warning("Camera frame dropped, retrying...")
-                time.sleep(0.01)
-                continue
+            if use_async:
+                # Capture frame NOW and kick off background inference
+                scene_frame = grab_frame(scene_cap)
+                wrist_frame = grab_frame(wrist_cap)
+                if scene_frame is not None and wrist_frame is not None:
+                    obs = {
+                        "observation/state": state.copy(),
+                        "observation/image_scene": scene_frame,
+                        "observation/image_wrist": wrist_frame,
+                        "prompt": args.prompt,
+                    }
+                    with lock:
+                        next_result["ready"] = False
+                    bg_thread = threading.Thread(
+                        target=_infer_worker, args=(policy, obs, next_result, lock),
+                        daemon=True,
+                    )
+                    bg_thread.start()
 
-            obs = {
-                "observation/state": state.copy(),
-                "observation/image_scene": scene_frame,
-                "observation/image_wrist": wrist_frame,
-                "prompt": args.prompt,
-            }
-
-            infer_start = time.perf_counter()
-            result = policy.infer(obs)
-            infer_ms = (time.perf_counter() - infer_start) * 1000
-            actions = result["actions"]
-
-            if step % 10 == 0:
-                logger.info(
-                    "Step %d | infer %.0fms | action[0]: [%s]",
-                    step, infer_ms,
-                    ", ".join(f"{v:+.3f}" for v in actions[0]),
-                )
-
+            # Execute current batch of actions
             for action_idx in range(len(actions)):
                 if shutdown:
                     break
@@ -347,6 +375,46 @@ def run(args):
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
+            if use_async:
+                # Wait for background inference if not ready yet
+                wait_start = time.perf_counter()
+                if bg_thread is not None:
+                    bg_thread.join()
+                wait_ms = (time.perf_counter() - wait_start) * 1000
+
+                with lock:
+                    if next_result["ready"]:
+                        actions = next_result["actions"]
+                        if step % 10 == 0:
+                            logger.info("Step %d | async gap %.0fms | action[0]: [%s]",
+                                        step, wait_ms,
+                                        ", ".join(f"{v:+.3f}" for v in actions[0]))
+                    else:
+                        logger.warning("Step %d | inference not ready, repeating last batch", step)
+            else:
+                # Synchronous: capture and infer now (arm freezes)
+                scene_frame = grab_frame(scene_cap)
+                wrist_frame = grab_frame(wrist_cap)
+                if scene_frame is None or wrist_frame is None:
+                    logger.warning("Camera frame dropped, retrying...")
+                    continue
+
+                obs = {
+                    "observation/state": state.copy(),
+                    "observation/image_scene": scene_frame,
+                    "observation/image_wrist": wrist_frame,
+                    "prompt": args.prompt,
+                }
+                infer_start = time.perf_counter()
+                result = policy.infer(obs)
+                infer_ms = (time.perf_counter() - infer_start) * 1000
+                actions = result["actions"]
+
+                if step % 10 == 0:
+                    logger.info("Step %d | sync infer %.0fms | action[0]: [%s]",
+                                step, infer_ms,
+                                ", ".join(f"{v:+.3f}" for v in actions[0]))
+
     finally:
         logger.info("Shutting down...")
         scene_cap.release()
@@ -369,6 +437,8 @@ def main():
                         default="Pick up the bottle and place it on the yellow outlined square.")
     parser.add_argument("--speed", type=float, default=SPEED, help="Movement speed multiplier")
     parser.add_argument("--max-steps", type=int, default=None, help="Max steps before stopping")
+    parser.add_argument("--sync", action="store_true",
+                        help="Use synchronous inference (default is async)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print predicted actions without sending to servos")
     args = parser.parse_args()

@@ -57,6 +57,9 @@ class Args:
     # Enable server-side depth estimation (adds scene depth as 3rd image for v4 configs).
     depth: bool = False
 
+    # Enable server-side depth grid computation (appends 4x4 depth grid to state for v5 configs).
+    depth_grid: bool = False
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -116,6 +119,11 @@ def main(args: Args) -> None:
         from openpi.policies.depth_augment import DepthAugmentedPolicy
         logging.info("Wrapping policy with server-side depth estimation")
         policy = DepthAugmentedPolicy(policy, device="cuda")
+
+    if args.depth_grid:
+        from openpi.policies.depth_augment import DepthGridAugmentedPolicy
+        logging.info("Wrapping policy with server-side depth grid computation")
+        policy = DepthGridAugmentedPolicy(policy, device="cuda")
 
     policy_metadata = policy.metadata
 

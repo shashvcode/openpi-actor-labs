@@ -326,12 +326,14 @@ class PromptFromLeRobotTask(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class PadStatesAndActions(DataTransformFn):
-    """Zero-pads states and actions to the model action dimension."""
+    """Zero-pads states and actions to the model dimensions."""
 
     model_action_dim: int
+    model_state_dim: int | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
+        state_dim = self.model_state_dim if self.model_state_dim is not None else self.model_action_dim
+        data["state"] = pad_to_dim(data["state"], state_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
         return data
