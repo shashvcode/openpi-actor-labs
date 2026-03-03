@@ -11,11 +11,13 @@ Usage (run on GPU):
 """
 
 import argparse
+import io
 import logging
 
 import numpy as np
 import torch
 import tqdm
+from PIL import Image
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,11 +40,8 @@ def load_depth_model(device: torch.device):
 
 
 @torch.no_grad()
-def compute_depth_grid(model, processor, rgb: np.ndarray, device: torch.device) -> np.ndarray:
-    """Estimate metric depth from RGB and return a flattened 4x4 grid (16 values in metres)."""
-    from PIL import Image
-
-    pil_img = Image.fromarray(rgb)
+def compute_depth_grid(model, processor, pil_img: Image.Image, device: torch.device) -> np.ndarray:
+    """Estimate metric depth from a PIL image and return a flattened 4x4 grid (16 values in metres)."""
     inputs = processor(images=pil_img, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
     if device.type == "cuda":
@@ -62,6 +61,27 @@ def compute_depth_grid(model, processor, rgb: np.ndarray, device: torch.device) 
     return grid
 
 
+def decode_image(img_data) -> Image.Image:
+    """Decode an image from various dataset formats."""
+    if isinstance(img_data, Image.Image):
+        return img_data.convert("RGB")
+    if isinstance(img_data, dict):
+        if "bytes" in img_data and img_data["bytes"] is not None:
+            return Image.open(io.BytesIO(img_data["bytes"])).convert("RGB")
+        if "path" in img_data and img_data["path"] is not None:
+            return Image.open(img_data["path"]).convert("RGB")
+    if isinstance(img_data, np.ndarray):
+        if img_data.ndim == 3 and img_data.shape[0] == 3:
+            img_data = np.transpose(img_data, (1, 2, 0))
+        return Image.fromarray(img_data).convert("RGB")
+    if hasattr(img_data, "numpy"):
+        arr = img_data.numpy()
+        if arr.ndim == 3 and arr.shape[0] == 3:
+            arr = np.transpose(arr, (1, 2, 0))
+        return Image.fromarray(arr).convert("RGB")
+    raise ValueError(f"Cannot decode image of type {type(img_data)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Precompute depth grids for a LeRobot dataset")
     parser.add_argument("--repo-id", type=str, default="verm11/runA")
@@ -73,11 +93,11 @@ def main():
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(args.device)
 
-    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+    from datasets import load_dataset
 
     logger.info("Loading dataset %s ...", args.repo_id)
-    dataset = LeRobotDataset(args.repo_id)
-    num_frames = len(dataset)
+    ds = load_dataset(args.repo_id, split="train")
+    num_frames = len(ds)
     logger.info("Dataset has %d frames", num_frames)
 
     model, processor = load_depth_model(device)
@@ -85,21 +105,13 @@ def main():
     grids = np.zeros((num_frames, GRID_H * GRID_W), dtype=np.float32)
 
     for idx in tqdm.tqdm(range(num_frames), desc="Computing depth grids"):
-        sample = dataset[idx]
-        scene_img = sample["observation.images.scene"]
+        row = ds[idx]
+        scene_data = row.get("observation.images.scene")
+        if scene_data is None:
+            continue
 
-        if hasattr(scene_img, "numpy"):
-            scene_img = scene_img.numpy()
-        scene_img = np.asarray(scene_img)
-
-        if scene_img.dtype != np.uint8:
-            if np.issubdtype(scene_img.dtype, np.floating):
-                scene_img = (scene_img * 255).astype(np.uint8)
-
-        if scene_img.ndim == 3 and scene_img.shape[0] == 3:
-            scene_img = np.transpose(scene_img, (1, 2, 0))
-
-        grids[idx] = compute_depth_grid(model, processor, scene_img, device)
+        pil_img = decode_image(scene_data)
+        grids[idx] = compute_depth_grid(model, processor, pil_img, device)
 
     np.save(args.output, grids)
     logger.info("Saved depth grids to %s — shape %s", args.output, grids.shape)
