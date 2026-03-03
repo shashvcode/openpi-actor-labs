@@ -146,8 +146,6 @@ class DepthGridAugmentedPolicy(base_policy.BasePolicy):
             if scene.dtype != np.uint8:
                 scene = (scene * 255).astype(np.uint8)
 
-            depth_grid = self._compute_grid(scene)
-            state = np.asarray(obs.get("observation/state", np.zeros(6, dtype=np.float32)))
-            obs["observation/state"] = np.concatenate([state, depth_grid])
+            obs["observation/depth_grid"] = self._compute_grid(scene)
 
         return self._inner.infer(obs)
