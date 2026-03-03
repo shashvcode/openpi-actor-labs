@@ -123,7 +123,7 @@ def main(args: Args) -> None:
     if args.depth_grid:
         from openpi.policies.depth_augment import DepthGridAugmentedPolicy
         logging.info("Wrapping policy with server-side depth grid computation")
-        policy = DepthGridAugmentedPolicy(policy, device="cuda")
+        policy = DepthGridAugmentedPolicy(policy, device="cpu")
 
     policy_metadata = policy.metadata
 
