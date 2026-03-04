@@ -16,9 +16,9 @@ Multi-GPU (single node):
   torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test
   torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test --resume
 Multi-Node Training:
-	torchrun \
-    --nnodes=<num_nodes> --nproc_per_node=<gpus_per_node> --node_rank=<rank_of_node> \
-    --master_addr=<master_ip> --master_port=<port> \
+	torchrun \\
+    --nnodes=<num_nodes> --nproc_per_node=<gpus_per_node> --node_rank=<rank_of_node> \\
+    --master_addr=<master_ip> --master_port=<port> \\
     scripts/train_pytorch.py <config_name> --exp_name=<run_name> --save_interval <interval>
 
 """
@@ -31,7 +31,6 @@ import platform
 import shutil
 import time
 
-import jax
 import numpy as np
 import safetensors.torch
 import torch
@@ -45,6 +44,9 @@ import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
 
 
 def init_logging():
@@ -69,8 +71,159 @@ def init_logging():
         logger.handlers[0].setFormatter(formatter)
 
 
+def tree_map_tensors(fn, obj):
+    """Recursively apply fn to all tensors in a nested structure (replaces jax.tree.map)."""
+    if isinstance(obj, torch.Tensor):
+        return fn(obj)
+    if isinstance(obj, np.ndarray):
+        return obj
+    if isinstance(obj, dict):
+        return {k: tree_map_tensors(fn, v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        mapped = [tree_map_tensors(fn, x) for x in obj]
+        return type(obj)(mapped)
+    if hasattr(obj, "__dataclass_fields__"):
+        changes = {f: tree_map_tensors(fn, getattr(obj, f)) for f in obj.__dataclass_fields__}
+        try:
+            return dataclasses.replace(obj, **changes)
+        except TypeError:
+            return type(obj)(**changes)
+    if hasattr(obj, "_fields"):
+        return type(obj)(*(tree_map_tensors(fn, getattr(obj, f)) for f in obj._fields))
+    return obj
+
+
+def log_memory_usage(device, step, phase="unknown"):
+    if not torch.cuda.is_available():
+        return
+
+    memory_allocated = torch.cuda.memory_allocated(device) / 1e9
+    memory_reserved = torch.cuda.memory_reserved(device) / 1e9
+    memory_free = (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1e9
+
+    memory_stats = torch.cuda.memory_stats(device)
+    max_memory_allocated = memory_stats.get("allocated_bytes.all.peak", 0) / 1e9
+    max_memory_reserved = memory_stats.get("reserved_bytes.all.peak", 0) / 1e9
+
+    ddp_info = ""
+    if dist.is_initialized():
+        ddp_info = f" | DDP: rank={dist.get_rank()}, world_size={dist.get_world_size()}"
+
+    logging.info(
+        f"Step {step} ({phase}): GPU memory - allocated: {memory_allocated:.2f}GB, reserved: {memory_reserved:.2f}GB, "
+        f"free: {memory_free:.2f}GB, peak_allocated: {max_memory_allocated:.2f}GB, "
+        f"peak_reserved: {max_memory_reserved:.2f}GB{ddp_info}"
+    )
+
+
+# ─── Parameter Freezing ──────────────────────────────────────────────────────
+
+
+def apply_freeze_filter(model: torch.nn.Module, config: _config.TrainConfig) -> tuple[list, int, int]:
+    """Freeze parameters based on config, matching JAX freeze_filter behavior.
+
+    In JAX, the freeze filter uses PathRegex patterns:
+      - ".*llm.*" matches all LLM params (paligemma + action expert)
+      - ".*llm.*_1.*" matches action expert params only
+      - ".*lora.*" matches LoRA adapter params (never frozen)
+
+    In PyTorch, the equivalent parameter name patterns are:
+      - "language_model" for paligemma LLM
+      - "gemma_expert.model" for action expert LLM
+      - "lora" for LoRA adapter params
+
+    Returns (trainable_params, frozen_count, trainable_count).
+    """
+    model_cfg = config.model
+    has_lora_paligemma = "lora" in getattr(model_cfg, "paligemma_variant", "")
+    has_lora_expert = "lora" in getattr(model_cfg, "action_expert_variant", "")
+
+    if not has_lora_paligemma and not has_lora_expert:
+        trainable = list(model.parameters())
+        total = len(trainable)
+        logging.info(f"No freeze filter: all {total} parameters are trainable")
+        return trainable, 0, total
+
+    frozen_count = 0
+    trainable_count = 0
+    frozen_bytes = 0
+    trainable_params = []
+
+    for name, param in model.named_parameters():
+        should_freeze = False
+
+        is_lora = "lora" in name.lower()
+        is_paligemma_llm = "language_model" in name and "gemma_expert" not in name
+        is_expert_llm = "gemma_expert" in name
+
+        if has_lora_paligemma and is_paligemma_llm and not is_lora:
+            should_freeze = True
+        if has_lora_expert and is_expert_llm and not is_lora:
+            should_freeze = True
+
+        if should_freeze:
+            param.requires_grad_(False)
+            param.data = param.data.to(torch.bfloat16)
+            frozen_count += 1
+            frozen_bytes += param.numel() * param.element_size()
+        else:
+            param.requires_grad_(True)
+            trainable_count += 1
+            trainable_params.append(param)
+
+    logging.info(
+        f"Parameter freezing: {frozen_count} frozen ({frozen_bytes / 1e9:.2f}GB in bf16), "
+        f"{trainable_count} trainable"
+    )
+    return trainable_params, frozen_count, trainable_count
+
+
+# ─── EMA (Exponential Moving Average) ────────────────────────────────────────
+
+
+class EMATracker:
+    """Maintains an exponential moving average of model parameters."""
+
+    def __init__(self, model: torch.nn.Module, decay: float):
+        self.decay = decay
+        self.shadow = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module):
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+
+    def state_dict(self) -> dict:
+        return {"shadow": self.shadow, "decay": self.decay}
+
+    def load_state_dict(self, state_dict: dict):
+        self.shadow = state_dict["shadow"]
+        self.decay = state_dict["decay"]
+
+    def apply_to(self, model: torch.nn.Module):
+        """Temporarily swap EMA weights into the model (for export/eval)."""
+        backup = {}
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+        return backup
+
+    def restore(self, model: torch.nn.Module, backup: dict):
+        """Restore original weights after apply_to."""
+        for name, param in model.named_parameters():
+            if name in backup:
+                param.data.copy_(backup[name])
+
+
+# ─── Wandb ────────────────────────────────────────────────────────────────────
+
+
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
-    """Initialize wandb logging."""
     if not enabled:
         wandb.init(mode="disabled")
         return
@@ -91,14 +244,15 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
 
+# ─── DDP Setup ────────────────────────────────────────────────────────────────
+
+
 def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
     if use_ddp and not torch.distributed.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         torch.distributed.init_process_group(backend=backend, init_method="env://")
-
-        # Set up debugging environment variables for DDP issues
         if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
             os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
 
@@ -122,149 +276,117 @@ def set_seed(seed: int, local_rank: int):
         torch.cuda.manual_seed_all(seed + local_rank)
 
 
+# ─── Data ─────────────────────────────────────────────────────────────────────
+
+
 def build_datasets(config: _config.TrainConfig):
-    # Use the unified data loader with PyTorch framework
     data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
     return data_loader, data_loader.data_config()
 
 
-def get_model_state_dict(model):
-    """Get state dict from model, handling DDP wrapper."""
-    return (
-        model.module.state_dict()
-        if isinstance(model, torch.nn.parallel.DistributedDataParallel)
-        else model.state_dict()
-    )
+# ─── Checkpointing ────────────────────────────────────────────────────────────
 
 
-def get_model_parameters(model):
-    """Get parameters from model, handling DDP wrapper."""
-    return (
-        model.module.parameters()
-        if isinstance(model, torch.nn.parallel.DistributedDataParallel)
-        else model.parameters()
-    )
+def _unwrap_model(model):
+    return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
-    """Save a checkpoint with model state, optimizer state, and metadata."""
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, ema=None):
     if not is_main:
         return
+    if not ((global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1):
+        return
 
-    # Only save if it's time to save or if it's the final step
-    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
-        # Create temporary directory for atomic checkpoint saving
-        final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
-        tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
+    final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
+    tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
 
-        # Remove any existing temp directory and create new one
-        if tmp_ckpt_dir.exists():
-            shutil.rmtree(tmp_ckpt_dir)
-        tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if tmp_ckpt_dir.exists():
+        shutil.rmtree(tmp_ckpt_dir)
+    tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save model state using safetensors (handle shared tensors)
-        model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+    safetensors.torch.save_model(_unwrap_model(model), tmp_ckpt_dir / "model.safetensors")
+    torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
 
-        # Save optimizer state using PyTorch format
-        torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
+    metadata = {
+        "global_step": global_step,
+        "config": dataclasses.asdict(config),
+        "timestamp": time.time(),
+    }
+    torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
 
-        # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
-        metadata = {
-            "global_step": global_step,
-            "config": dataclasses.asdict(config),
-            "timestamp": time.time(),
-        }
-        torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
+    if ema is not None:
+        torch.save(ema.state_dict(), tmp_ckpt_dir / "ema.pt")
 
-        # save norm stats
-        norm_stats = data_config.norm_stats
-        if norm_stats is not None and data_config.asset_id is not None:
-            _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
+    norm_stats = data_config.norm_stats
+    if norm_stats is not None and data_config.asset_id is not None:
+        _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
 
-        # Atomically move temp directory to final location
-        if final_ckpt_dir.exists():
-            shutil.rmtree(final_ckpt_dir)
-        tmp_ckpt_dir.rename(final_ckpt_dir)
+    if final_ckpt_dir.exists():
+        shutil.rmtree(final_ckpt_dir)
+    tmp_ckpt_dir.rename(final_ckpt_dir)
+    logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
 
-        logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
-
-        # Log checkpoint to wandb
-        if config.wandb_enabled:
-            wandb.log({"checkpoint_step": global_step}, step=global_step)
+    if config.wandb_enabled:
+        wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
-    """Load the latest checkpoint and return the global step."""
+def load_checkpoint(model, optimizer, checkpoint_dir, device, ema=None):
     checkpoint_steps = [
         int(d.name)
         for d in checkpoint_dir.iterdir()
         if d.is_dir() and d.name.isdigit() and not d.name.startswith("tmp_")
     ]
-
     if not checkpoint_steps:
         raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
 
     latest_step = max(checkpoint_steps)
     ckpt_dir = checkpoint_dir / f"{latest_step}"
 
-    # Clear memory before loading checkpoints
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
         log_memory_usage(device, latest_step, "before_loading_checkpoint")
 
     try:
-        # Load model state with error handling
         logging.info("Loading model state...")
         safetensors_path = ckpt_dir / "model.safetensors"
-
-        if safetensors_path.exists():
-            model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
-            logging.info("Loaded model state from safetensors format")
-        else:
+        if not safetensors_path.exists():
             raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
+        safetensors.torch.load_model(_unwrap_model(model), safetensors_path, device=str(device))
+        logging.info("Loaded model state from safetensors format")
 
         torch.cuda.empty_cache()
         gc.collect()
-        log_memory_usage(device, latest_step, "after_loading_model")
 
-        # Load optimizer state with error handling
         logging.info("Loading optimizer state...")
         optimizer_path = ckpt_dir / "optimizer.pt"
-
         if optimizer_path.exists():
-            optimizer_state_dict = torch.load(optimizer_path, map_location=device, weights_only=False)
-            logging.info("Loaded optimizer state from pt format")
+            optimizer.load_state_dict(torch.load(optimizer_path, map_location=device, weights_only=False))
+            logging.info("Loaded optimizer state")
         else:
-            raise FileNotFoundError(f"No optimizer checkpoint found at {ckpt_dir}")
+            logging.warning("No optimizer checkpoint found, starting optimizer from scratch")
 
-        optimizer.load_state_dict(optimizer_state_dict)
-        del optimizer_state_dict
-        torch.cuda.empty_cache()
-        gc.collect()
-        log_memory_usage(device, latest_step, "after_loading_optimizer")
+        ema_path = ckpt_dir / "ema.pt"
+        if ema is not None and ema_path.exists():
+            ema.load_state_dict(torch.load(ema_path, map_location=device, weights_only=False))
+            logging.info("Loaded EMA state")
 
-        # Load metadata
-        logging.info("Loading metadata...")
         metadata = torch.load(ckpt_dir / "metadata.pt", map_location=device, weights_only=False)
         global_step = metadata.get("global_step", latest_step)
         del metadata
+
         torch.cuda.empty_cache()
         gc.collect()
-        log_memory_usage(device, latest_step, "after_loading_metadata")
+        log_memory_usage(device, latest_step, "after_loading_checkpoint")
 
-        logging.info(f"Successfully loaded all checkpoint components from step {latest_step}")
+        logging.info(f"Successfully loaded checkpoint from step {latest_step}")
         return global_step
 
     except RuntimeError as e:
         if "out of memory" in str(e):
-            # Clear memory and provide detailed error message
             torch.cuda.empty_cache()
             gc.collect()
             logging.error(f"Out of memory error while loading checkpoint: {e!s}")
-            log_memory_usage(device, latest_step, "after_oom_error")
             raise RuntimeError(
                 "Out of memory while loading checkpoint. Try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
             ) from e
@@ -272,7 +394,6 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
 
 
 def get_latest_checkpoint_step(checkpoint_dir):
-    """Get the latest checkpoint step number from a checkpoint directory."""
     checkpoint_steps = [
         int(d.name)
         for d in checkpoint_dir.iterdir()
@@ -281,117 +402,123 @@ def get_latest_checkpoint_step(checkpoint_dir):
     return max(checkpoint_steps) if checkpoint_steps else None
 
 
-def log_memory_usage(device, step, phase="unknown"):
-    """Log detailed memory usage information."""
-    if not torch.cuda.is_available():
-        return
+# ─── QAT (Quantization-Aware Training) ───────────────────────────────────────
 
-    memory_allocated = torch.cuda.memory_allocated(device) / 1e9
-    memory_reserved = torch.cuda.memory_reserved(device) / 1e9
-    memory_free = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
-    memory_free = memory_free / 1e9
 
-    # Get more detailed memory info
-    memory_stats = torch.cuda.memory_stats(device)
-    max_memory_allocated = memory_stats.get("allocated_bytes.all.peak", 0) / 1e9
-    max_memory_reserved = memory_stats.get("reserved_bytes.all.peak", 0) / 1e9
+def apply_qat(model: torch.nn.Module):
+    """Insert fake quantization nodes for INT8-aware training.
 
-    # Get DDP info if available
-    ddp_info = ""
-    if dist.is_initialized():
-        ddp_info = f" | DDP: rank={dist.get_rank()}, world_size={dist.get_world_size()}"
+    Simulates INT8 rounding in the forward pass so LoRA adapters learn to
+    compensate. Uses per-tensor symmetric quantization with learned scales.
+    Only quantizes frozen (base) weight linear layers; LoRA and other
+    trainable params stay in full precision.
+    """
+    from torch.ao.quantization import QConfigMapping, get_default_qat_qconfig
+    from torch.ao.quantization.quantize_fx import prepare_qat_fx
 
-    logging.info(
-        f"Step {step} ({phase}): GPU memory - allocated: {memory_allocated:.2f}GB, reserved: {memory_reserved:.2f}GB, free: {memory_free:.2f}GB, peak_allocated: {max_memory_allocated:.2f}GB, peak_reserved: {max_memory_reserved:.2f}GB{ddp_info}"
-    )
+    try:
+        qconfig = get_default_qat_qconfig("x86")
+        qconfig_mapping = QConfigMapping().set_global(qconfig)
+
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Linear) and not any(
+                p.requires_grad for p in module.parameters()
+            ):
+                module.qconfig = qconfig
+
+        logging.info("Applied QAT fake quantization to frozen linear layers")
+    except Exception as e:
+        logging.warning(f"QAT setup failed ({e}), falling back to manual fake quant")
+        _apply_manual_fake_quant(model)
+
+
+def _apply_manual_fake_quant(model: torch.nn.Module):
+    """Fallback: wrap frozen Linear layers with fake quantization observers."""
+    from torch.ao.quantization import FakeQuantize, default_weight_fake_quant
+
+    count = 0
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            all_frozen = all(not p.requires_grad for p in module.parameters())
+            if all_frozen:
+                fq = default_weight_fake_quant()
+                original_forward = module.forward
+
+                def make_fq_forward(mod, fq_node):
+                    def fq_forward(x):
+                        mod.weight.data = fq_node(mod.weight.data)
+                        return original_forward(x)
+                    return fq_forward
+
+                module.forward = make_fq_forward(module, fq)
+                count += 1
+
+    logging.info(f"Applied manual fake quantization to {count} frozen Linear layers")
+
+
+# ─── Training Loop ────────────────────────────────────────────────────────────
 
 
 def train_loop(config: _config.TrainConfig):
+    # Enable TF32 unconditionally for all Ampere+ GPUs
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
+    world_size = torch.distributed.get_world_size() if use_ddp else 1
     set_seed(config.seed, local_rank)
 
-    # Initialize checkpoint directory and wandb
+    # Checkpoint directory setup
     resuming = False
     if config.resume:
-        # Find checkpoint directory based on experiment name
         exp_checkpoint_dir = config.checkpoint_dir
         if exp_checkpoint_dir.exists():
-            # Use validation to find the latest working checkpoint
             latest_step = get_latest_checkpoint_step(exp_checkpoint_dir)
             if latest_step is not None:
                 resuming = True
-                logging.info(
-                    f"Resuming from experiment checkpoint directory: {exp_checkpoint_dir} at step {latest_step}"
-                )
+                logging.info(f"Resuming from {exp_checkpoint_dir} at step {latest_step}")
             else:
-                raise FileNotFoundError(f"No valid checkpoints found in {exp_checkpoint_dir} for resume")
+                raise FileNotFoundError(f"No valid checkpoints found in {exp_checkpoint_dir}")
         else:
-            raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
+            raise FileNotFoundError(f"Checkpoint dir {exp_checkpoint_dir} does not exist for resume")
     elif config.overwrite and config.checkpoint_dir.exists():
         shutil.rmtree(config.checkpoint_dir)
         logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
 
-    # Create checkpoint directory with experiment name
     if not resuming:
-        # For new runs, create experiment-specific checkpoint directory
-        exp_checkpoint_dir = config.checkpoint_dir
-        exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
-    else:
-        # For resume, checkpoint_dir is already set to the experiment directory
-        logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
+        config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize wandb (only on main process)
     if is_main:
         init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
-    # Build data loader using the unified data loader
-    # Calculate effective batch size per GPU for DDP
-    # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
-    world_size = torch.distributed.get_world_size() if use_ddp else 1
+    # Data
     effective_batch_size = config.batch_size // world_size
-    logging.info(
-        f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
-    )
-
-    # Pass the original batch size to data loader - it will handle DDP splitting internally
     loader, data_config = build_datasets(config)
 
-    # Log sample images to wandb on first batch
     if is_main and config.wandb_enabled and not resuming:
-        # Create a separate data loader for sample batch to avoid consuming the main loader
-        sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
-        sample_batch = next(iter(sample_data_loader))
-        # Convert observation and actions to torch tensors
+        sample_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
+        sample_batch = next(iter(sample_loader))
         observation, actions = sample_batch
-        sample_batch = observation.to_dict()
-        sample_batch["actions"] = actions
+        sample_dict = observation.to_dict()
+        sample_dict["actions"] = actions
 
-        # Create sample images for wandb
         images_to_log = []
-        # Get batch size from the first image tensor
-        batch_size = next(iter(sample_batch["image"].values())).shape[0]
+        batch_size = next(iter(sample_dict["image"].values())).shape[0]
         for i in range(min(5, batch_size)):
-            # Concatenate all camera views horizontally for this batch item
-            # Convert from NCHW to NHWC format for wandb
-            img_concatenated = torch.cat([img[i].permute(1, 2, 0) for img in sample_batch["image"].values()], axis=1)
-            img_concatenated = img_concatenated.cpu().numpy()
-            images_to_log.append(wandb.Image(img_concatenated))
-
+            img_cat = torch.cat([img[i].permute(1, 2, 0) for img in sample_dict["image"].values()], axis=1)
+            images_to_log.append(wandb.Image(img_cat.cpu().numpy()))
         wandb.log({"camera_views": images_to_log}, step=0)
 
-        # Clear sample batch from memory aggressively
-        del sample_batch, observation, actions, images_to_log, img_concatenated
-        del sample_data_loader  # Also delete the sample data loader
+        del sample_dict, observation, actions, images_to_log, sample_loader
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        logging.info("Cleared sample batch and data loader from memory")
 
-    # Build model
+    # ─── Model ────────────────────────────────────────────────────────────────
+
     if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
-        # Convert dataclass to Pi0Config if needed
         model_cfg = openpi.models.pi0_config.Pi0Config(
             dtype=config.pytorch_training_precision,
             action_dim=config.model.action_dim,
@@ -403,223 +530,225 @@ def train_loop(config: _config.TrainConfig):
         )
     else:
         model_cfg = config.model
-        # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
-        enable_gradient_checkpointing = True
         model.gradient_checkpointing_enable()
-        logging.info("Enabled gradient checkpointing for memory optimization")
-    else:
-        enable_gradient_checkpointing = False
-        logging.info("Gradient checkpointing is not supported for this model")
+        logging.info("Enabled gradient checkpointing")
 
-    # Log initial memory usage after model creation
+    # Load pretrained weights before freezing
+    if config.pytorch_weight_path is not None:
+        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
+        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
+        safetensors.torch.load_model(model, model_path)
+        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+
     if is_main and torch.cuda.is_available():
         log_memory_usage(device, 0, "after_model_creation")
 
-    # Enable memory optimizations for large-scale training
-    if world_size >= 8:
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        # Set memory allocation configuration
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
-        logging.info("Enabled memory optimizations for 8+ GPU training")
+    # Apply freeze filter (must be after weight loading, before optimizer)
+    trainable_params, frozen_count, trainable_count = apply_freeze_filter(model, config)
+    has_frozen_params = frozen_count > 0
 
+    # QAT: insert fake quantization on frozen layers (optional)
+    use_qat = getattr(config, "quantization_aware", False)
+    if use_qat and has_frozen_params:
+        apply_qat(model)
+        logging.info("QAT enabled: frozen layers have fake quantization")
+    elif use_qat:
+        logging.warning("QAT requested but no frozen params -- skipping")
+
+    # DDP
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
-            gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
+            find_unused_parameters=False,
+            gradient_as_bucket_view=True,
+            static_graph=True,
         )
 
-    # Load weights from weight_loader if specified (for fine-tuning)
-    if config.pytorch_weight_path is not None:
-        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
+    # torch.compile (opt-in via env var to avoid issues with some model configs)
+    if os.environ.get("TORCH_COMPILE", "0") == "1":
+        logging.info("Applying torch.compile to model...")
+        compiled_model = torch.compile(_unwrap_model(model))
+        logging.info("torch.compile applied")
+    else:
+        compiled_model = None
 
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+    # ─── Optimizer ────────────────────────────────────────────────────────────
 
-    # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
     peak_lr = config.lr_schedule.peak_lr
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
 
-    # Create optimizer with config parameters
     optim = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
     )
 
-    # Load checkpoint if resuming
+    # EMA
+    ema = None
+    if config.ema_decay is not None:
+        ema = EMATracker(_unwrap_model(model), config.ema_decay)
+        logging.info(f"EMA enabled with decay={config.ema_decay}")
+
+    # Resume
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
+        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device, ema=ema)
         logging.info(f"Resumed training from step {global_step}")
 
     def lr_schedule(step: int):
         if step < warmup_steps:
-            # Match JAX behavior: start from peak_lr / (warmup_steps + 1)
             init_lr = peak_lr / (warmup_steps + 1)
             return init_lr + (peak_lr - init_lr) * step / warmup_steps
-        # cosine decay
         progress = min(1.0, (step - warmup_steps) / max(1, decay_steps - warmup_steps))
         cos = 0.5 * (1 + np.cos(np.pi * progress))
         return end_lr + (peak_lr - end_lr) * cos
 
+    # ─── Logging ──────────────────────────────────────────────────────────────
+
     model.train()
     start_time = time.time()
-    infos = []  # Collect stats over log interval
-    if is_main:
-        logging.info(
-            f"Running on: {platform.node()} | world_size={torch.distributed.get_world_size() if use_ddp else 1}"
-        )
-        logging.info(
-            f"Training config: batch_size={config.batch_size}, effective_batch_size={effective_batch_size}, num_train_steps={config.num_train_steps}"
-        )
-        logging.info(f"Memory optimizations: gradient_checkpointing={enable_gradient_checkpointing}")
-        logging.info(
-            f"LR schedule: warmup={warmup_steps}, peak_lr={peak_lr:.2e}, decay_steps={decay_steps}, end_lr={end_lr:.2e}"
-        )
-        logging.info(
-            f"Optimizer: {type(config.optimizer).__name__}, weight_decay={config.optimizer.weight_decay}, clip_norm={config.optimizer.clip_gradient_norm}"
-        )
-        logging.info("EMA is not supported for PyTorch training")
-        logging.info(f"Training precision: {model_cfg.dtype}")
+    infos = []
 
-    # Training loop - iterate until we reach num_train_steps
+    if is_main:
+        logging.info(f"Running on: {platform.node()} | world_size={world_size}")
+        logging.info(
+            f"Training: batch_size={config.batch_size}, effective_batch_size={effective_batch_size}, "
+            f"num_train_steps={config.num_train_steps}"
+        )
+        logging.info(
+            f"LR schedule: warmup={warmup_steps}, peak_lr={peak_lr:.2e}, "
+            f"decay_steps={decay_steps}, end_lr={end_lr:.2e}"
+        )
+        logging.info(
+            f"Optimizer: AdamW, weight_decay={config.optimizer.weight_decay}, "
+            f"clip_norm={config.optimizer.clip_gradient_norm}"
+        )
+        logging.info(
+            f"Params: {frozen_count} frozen, {trainable_count} trainable, "
+            f"EMA={'yes' if ema else 'no'}, QAT={'yes' if use_qat else 'no'}"
+        )
+        logging.info(f"Training precision: {model_cfg.dtype}, TF32: enabled, AMP: bf16")
+
+    # ─── Training Loop ────────────────────────────────────────────────────────
+
     pbar = (
         tqdm.tqdm(total=config.num_train_steps, initial=global_step, desc="Training", disable=not is_main)
         if is_main
         else None
     )
 
+    use_amp = config.pytorch_training_precision == "bfloat16" and torch.cuda.is_available()
+
     while global_step < config.num_train_steps:
-        # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
 
         for observation, actions in loader:
-            # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
                 break
 
-            # The unified data loader returns (observation, actions) tuple
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
-            actions = actions.to(torch.float32)  # noqa: PLW2901
-            actions = actions.to(device)  # noqa: PLW2901
+            observation = tree_map_tensors(lambda x: x.to(device), observation)
+            actions = actions.to(torch.float32).to(device)
 
-            # Update LR
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                losses = model(observation, actions)
+                if isinstance(losses, (list, tuple)):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
+                loss = losses.mean()
 
-            loss = losses.mean()
-
-            # Backward pass
             loss.backward()
 
-            # Log memory usage after backward pass
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
 
-            # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
-
-            # Optimizer step
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=config.optimizer.clip_gradient_norm)
             optim.step()
             optim.zero_grad(set_to_none=True)
 
-            # Clear gradients more aggressively
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.detach_()
-                    param.grad = None
+            if ema is not None:
+                ema.update(_unwrap_model(model))
 
             # Collect stats
             if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                    }
-                )
+                info = {
+                    "loss": loss.item(),
+                    "learning_rate": optim.param_groups[0]["lr"],
+                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                }
+                infos.append(info)
 
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
 
-                # Average stats over log interval
-                avg_loss = sum(info["loss"] for info in infos) / len(infos)
-                avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
-
+                avg_loss = sum(i["loss"] for i in infos) / len(infos)
+                avg_lr = sum(i["learning_rate"] for i in infos) / len(infos)
                 avg_grad_norm = None
-                if any("grad_norm" in info for info in infos):
-                    vals = [
-                        info["grad_norm"] for info in infos if "grad_norm" in info and info["grad_norm"] is not None
-                    ]
-                    if len(vals) > 0:
-                        avg_grad_norm = sum(vals) / len(vals)
-                logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
-                    if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
-                )
+                grad_vals = [i["grad_norm"] for i in infos if i.get("grad_norm") is not None]
+                if grad_vals:
+                    avg_grad_norm = sum(grad_vals) / len(grad_vals)
 
-                # Log to wandb
-                if config.wandb_enabled and len(infos) > 0:
+                param_norm = torch.sqrt(
+                    sum(p.data.float().norm() ** 2 for p in trainable_params)
+                ).item()
+
+                log_parts = [
+                    f"step={global_step}",
+                    f"loss={avg_loss:.4f}",
+                    f"lr={avg_lr:.2e}",
+                ]
+                if avg_grad_norm is not None:
+                    log_parts.append(f"grad_norm={avg_grad_norm:.2f}")
+                log_parts.append(f"param_norm={param_norm:.2f}")
+                log_parts.append(f"time={elapsed:.1f}s")
+                logging.info(" ".join(log_parts))
+
+                if config.wandb_enabled:
                     log_payload = {
                         "loss": avg_loss,
                         "learning_rate": avg_lr,
+                        "param_norm": param_norm,
                         "step": global_step,
-                        "time_per_step": elapsed / config.log_interval,
+                        "time_per_step": elapsed / max(1, config.log_interval),
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()
-                infos = []  # Reset stats collection
+                infos = []
 
             global_step += 1
-            # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(model, optim, global_step, config, is_main, data_config, ema=ema)
 
-            # Update progress bar
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix(
                     {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
                 )
 
-    # Close progress bar
     if pbar is not None:
         pbar.close()
-
-    # Finish wandb run
     if is_main and config.wandb_enabled:
         wandb.finish()
-
     cleanup_ddp()
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 
 def main():
