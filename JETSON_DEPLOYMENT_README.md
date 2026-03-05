@@ -25,9 +25,12 @@ All results with shared device buffers enabled (the default).
 **INT8 accuracy note**: MSE 0.082 is from post-training quantization with synthetic calibration data. This can be improved significantly through (a) calibration with real robot observations, (b) QAT during LoRA fine-tuning (expected MSE < 0.005), or (c) FP8 quantization. For initial physical testing, BF16 (158ms, MSE 0.017) is the safe choice; INT8 should be validated on the real robot.
 
 **Recommended configurations**:
-- **Safe (BF16)**: 158ms, 6.3 Hz -- proven low MSE, good for validation
-- **Fast (INT8)**: 108ms, 9.3 Hz -- needs robot validation, QAT will fix accuracy
-- **Debug (FP32)**: 263ms, 3.8 Hz -- numerically identical to PyTorch reference
+- **FP32**: 263ms, 3.8 Hz — numerically faithful to PyTorch reference. Use for pipeline validation.
+- **INT8 (with QAT)**: 108ms, 9.3 Hz — target for production after QAT training.
+
+**⚠ BF16/FP16 are NOT recommended**: Live arm testing revealed systematic biases in BF16 (sign flip on wrist_flex dimension, +1.117 diff). FP16 was better but still showed drift. Use FP32 to validate, then train a QAT model for INT8.
+
+**⚠ Current model (runC) has issues**: The existing `model.safetensors` was converted from JAX using `convert_jax_model_to_pytorch.py`. Live arm tests with both the TRT server AND direct PyTorch inference produced incorrect behavior (arm reaching up/back). The JAX model on RunPod works correctly with the same arm/cameras. **Root cause**: likely the JAX→PyTorch weight conversion. **Fix**: train natively in PyTorch (see [Cloud Training Guide](#cloud-training-native-pytorch)).
 
 ---
 
@@ -86,8 +89,13 @@ Action trajectory (11 steps x 6 dims)
 | `scripts/generate_calibration_data.py` | Generate synthetic calibration data for INT8 quantization | Done |
 | `scripts/build_int8_engines.py` | Build INT8 TRT engines with entropy calibration | In progress |
 | `scripts/serve_policy_nodeps.py` | Lightweight policy server (no openpi dependencies) | Available |
+| `scripts/serve_pytorch_minimal.py` | Minimal PyTorch WebSocket server (runs in Docker, no TRT) | Done |
 | `scripts/train_pytorch.py` | Fixed PyTorch training script (freeze filter, EMA, AMP, QAT) | Done |
 | `scripts/verify_training_fixes.py` | Verification suite for training script fixes (7 tests) | Done |
+| `scripts/verify_conversion.py` | Numerical comparison of JAX vs PyTorch model outputs | Done |
+| `scripts/compare_trt_vs_pytorch.py` | Side-by-side TRT vs PyTorch output comparison (fixed noise) | Done |
+| `scripts/compare_trt_direct.py` | Direct TRT engine inference with fixed noise for debugging | Done |
+| `CLOUD_TRAINING_GUIDE.md` | Step-by-step guide for training on cloud H100s | Done |
 
 ### Key Files
 
@@ -243,6 +251,8 @@ All observation preprocessing (image resize, normalization, tokenization) uses N
 
 ## Known Issues and Fixes
 
+### Build/Export Issues
+
 | Issue | Root Cause | Fix |
 |-------|-----------|-----|
 | `Cos(7) not implemented` in ONNX | `create_sinusoidal_pos_embedding` generated float64 | Monkey-patched `get_safe_dtype` to force float32 |
@@ -252,6 +262,26 @@ All observation preprocessing (image resize, normalization, tokenization) uses N
 | `cudart` import error | `cuda-python` API changed | Import from `cuda.bindings.runtime` |
 | `cudaError_t` no `.value` | Tuple-based error returns in `cuda-python` | `_check()` helper handles both formats |
 | KV cache overhead (65ms) | 306 MB copied H↔D every denoise step | Shared device buffers (0ms overhead) |
+
+### Deployment Issues (Live Arm Testing)
+
+| Issue | Root Cause | Fix |
+|-------|-----------|-----|
+| Arm "incredibly wrong" (reaching up/back) | Missing quantile normalization in TRT server | Added `QuantileNormalizer` class using `norm_stats.json` |
+| BF16 TRT sign flip on wrist_flex (+1.117 diff) | BF16 precision loss causes systematic bias in flow-matching ODE | Use FP32 for validation; train QAT model for INT8 production |
+| Arm still erratic with FP32 TRT | Suspected JAX→PyTorch conversion error | Train natively in PyTorch (see cloud guide) |
+| Arm erratic with PyTorch direct (Docker) | Same converted weights; also sm_110 GPU may have kernel compat issues | Train natively in PyTorch on standard GPUs (H100/A100) |
+| `cv2`/numpy incompatibility on Jetson host | `numpy 2.4.2` incompatible with system `cv2` | Installed `opencv-python-headless==4.13.0.92`; TRT server uses PIL instead |
+| Msgpack deserialization `TypeError` | `openpi_client` custom numpy serialization format | Import `Packer`/`unpackb` from `openpi_client.msgpack_numpy` |
+| `ModuleNotFoundError: transformers` on host | Missing pip package | `pip3 install --break-system-packages transformers tqdm_loggable` |
+
+### Training Script Issues
+
+| Issue | Root Cause | Fix |
+|-------|-----------|-----|
+| QAT closure bug | `original_forward` captured by reference in loop, all wrappers call last module's forward | Pass `module.forward` as explicit parameter to factory function |
+| Silent random-weight training | `pytorch_weight_path=None` + `strict=False` in conversion = model trains from scratch | Added runtime guard that refuses to start if config has JAX weight_loader but no pytorch_weight_path |
+| No pretrained base for PyTorch SO100 configs | Config has JAX `weight_loader` but PyTorch script ignores it | Documented conversion steps; guard raises error with instructions |
 
 ---
 
@@ -327,6 +357,48 @@ This preserves `QuantizeLinear`/`DequantizeLinear` ops in the ONNX graph so Tens
 
 ---
 
+## Cloud Training (Native PyTorch) {#cloud-training-native-pytorch}
+
+The current model (`runC`) was converted from JAX and produces incorrect arm behavior. The fix is to **train natively in PyTorch**, eliminating the JAX→PyTorch conversion from the pipeline entirely.
+
+A full guide is in **`CLOUD_TRAINING_GUIDE.md`**. Summary:
+
+```bash
+# 1. Convert JAX base checkpoint to PyTorch (one-time)
+python examples/convert_jax_model_to_pytorch.py \
+    --checkpoint_dir gs://openpi-assets/checkpoints/pi05_base \
+    --config_name pi05_so100_lora_v3 \
+    --output_path ./checkpoints/pi05_base_pytorch --precision float32
+
+# 2. Verify conversion is numerically correct
+python scripts/verify_conversion.py \
+    --config_name pi05_so100_lora_v3 \
+    --pytorch_weight_path ./checkpoints/pi05_base_pytorch
+
+# 3. Train (single H100, ~1-2 hrs)
+python scripts/train_pytorch.py pi05_so100_lora_v3 \
+    --pytorch_weight_path ./checkpoints/pi05_base_pytorch --exp_name runD
+```
+
+Output: `checkpoints/pi05_so100_lora_v3/runD/10000/model.safetensors` — native PyTorch weights, no conversion risk.
+
+### Why This Fixes the Problem
+
+- **runC** (current): JAX training → `convert_jax_model_to_pytorch.py` → `model.safetensors`. The conversion uses `load_state_dict(strict=False)` which silently ignores errors. The converted model produces wrong arm behavior even in pure PyTorch — the JAX model works fine.
+- **runD** (planned): PyTorch training directly saves `model.safetensors` via `safetensors.torch.save_model()`. No conversion. No ambiguity.
+
+### Training Script Audit Results
+
+The PyTorch training script (`train_pytorch.py`) was audited against the JAX reference (`train.py`). Core training logic matches:
+- Loss function (flow-matching MSE) ✓
+- Time sampling (Beta(1.5, 1.0) * 0.999 + 0.001) ✓
+- Optimizer (AdamW, same hyperparameters, clip-then-step ordering) ✓
+- LR schedule (warmup cosine decay, equivalent formulation) ✓
+- Freeze filter (same parameters frozen/trainable in both) ✓
+- Data pipeline (same transforms, normalization, dataset) ✓
+
+---
+
 ## Pipeline Reusability
 
 This pipeline is designed to work with any pi-0.x model variant:
@@ -343,31 +415,43 @@ This pipeline is designed to work with any pi-0.x model variant:
 
 ## Training Pipeline
 
-### Current Pipeline (JAX → PyTorch → TRT)
+### Recommended Pipeline (Native PyTorch → TRT)
 
 ```
-PI pretrained weights (JAX)
+PI pretrained weights (JAX, on GCS)
     │
-    ▼ [one-time conversion per base model]
-PyTorch base weights
+    ▼ [one-time conversion: convert_jax_model_to_pytorch.py]
+    │   Converts base weights only (not fine-tuned)
+    │   Verified with verify_conversion.py (MSE < 1e-4)
     │
-    ▼ [LoRA fine-tuning: train_pytorch.py]
+PyTorch base weights (model.safetensors)
+    │
+    ▼ [LoRA fine-tuning on cloud H100s: train_pytorch.py]
     │   ✅ Parameter freezing (frozen LLM → bf16, only LoRA+projections trainable)
-    │   ✅ EMA tracking (shadow params saved with checkpoint)
     │   ✅ AMP bf16 autocast + TF32 matmuls
     │   ✅ DDP with static_graph=True
+    │   ✅ Safety guard: refuses to start from random weights
+    │   ✅ Optional QAT for INT8 deployment
     │
-Fine-tuned PyTorch checkpoint (e.g. runC, runD, ...)
+Fine-tuned PyTorch checkpoint (e.g. runD, runE, ...)
+    │   Natively PyTorch — NO JAX conversion in the loop
     │
     ▼ [export_pytorch_onnx.py]
 ONNX models (prefix + denoise)
     │
     ▼ [trtexec or build_int8_engines.py]
-TRT engines (FP32/BF16/INT8)
+TRT engines (FP32 for validation, INT8 with QAT for production)
     │
     ▼ [trt_policy_server.py]
 WebSocket policy server → Robot
 ```
+
+### Previous Pipeline (JAX → PyTorch → TRT) ⚠ DEPRECATED
+
+The runC model was created by training in JAX, then converting weights with
+`convert_jax_model_to_pytorch.py`. This produced incorrect arm behavior despite
+the conversion appearing complete (812/813 parameter keys matched). The JAX model
+works correctly on the same arm/cameras. Use the native PyTorch pipeline above instead.
 
 ### Ready: QAT Pipeline (no calibration needed)
 
@@ -423,3 +507,13 @@ All configs use LoRA on both Gemma 2B (language) and Gemma 300M (action expert),
 | 2026-03-04 | Fixed PyTorch training script: parameter freezing, EMA, AMP, DDP, removed JAX dep |
 | 2026-03-04 | Added QAT support to training script + ONNX export |
 | 2026-03-04 | Verified all training fixes (7/7 tests pass on Jetson Thor) |
+| 2026-03-05 | Live arm testing: identified missing quantile normalization in TRT server, fixed |
+| 2026-03-05 | Precision comparison: BF16 has sign flip on wrist_flex, FP32 much closer to PyTorch |
+| 2026-03-05 | Live arm testing with FP32 TRT: less wrong but still incorrect behavior |
+| 2026-03-05 | Live arm testing with PyTorch direct (Docker): also incorrect — rules out TRT as cause |
+| 2026-03-05 | Root cause identified: JAX→PyTorch weight conversion. JAX model works on same arm/cameras |
+| 2026-03-05 | Audited train_pytorch.py vs train.py: core logic matches, identified 3 bugs |
+| 2026-03-05 | Fixed QAT closure bug (original_forward captured by reference) |
+| 2026-03-05 | Added safety guard against accidental random-weight training |
+| 2026-03-05 | Created CLOUD_TRAINING_GUIDE.md and verify_conversion.py |
+| 2026-03-05 | Pushed all changes to razafork/jetson-integration |
