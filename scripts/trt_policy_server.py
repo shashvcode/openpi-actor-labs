@@ -20,10 +20,13 @@ import logging
 import pathlib
 import time
 
-import msgpack_numpy
+import msgpack
 import numpy as np
 import websockets.asyncio.server as ws_server
 import websockets.frames
+
+# Use the same msgpack-numpy protocol as openpi_client (__ndarray__ keys)
+from openpi_client.msgpack_numpy import Packer as MsgPacker, unpackb as msg_unpackb
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -36,10 +39,38 @@ ACTION_DIM = 6
 ACTION_HORIZON = 11
 NUM_DENOISE_STEPS = 8
 
+NORM_STATS_PATH = None  # Set at startup
+
+
+class QuantileNormalizer:
+    """Quantile normalization matching openpi's transforms.Normalize/Unnormalize."""
+
+    def __init__(self, norm_stats_path: str):
+        import json
+        with open(norm_stats_path) as f:
+            raw = json.load(f)["norm_stats"]
+        self.state_q01 = np.array(raw["state"]["q01"], dtype=np.float32)
+        self.state_q99 = np.array(raw["state"]["q99"], dtype=np.float32)
+        self.action_q01 = np.array(raw["actions"]["q01"], dtype=np.float32)
+        self.action_q99 = np.array(raw["actions"]["q99"], dtype=np.float32)
+        log.info("Loaded norm stats: state q01=%s q99=%s", self.state_q01, self.state_q99)
+
+    def normalize_state(self, state: np.ndarray) -> np.ndarray:
+        q01, q99 = self.state_q01[: state.shape[-1]], self.state_q99[: state.shape[-1]]
+        return (state - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+
+    def unnormalize_actions(self, actions: np.ndarray) -> np.ndarray:
+        q01, q99 = self.action_q01, self.action_q99
+        dim = q01.shape[-1]
+        if dim < actions.shape[-1]:
+            head = (actions[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+            return np.concatenate([head, actions[..., dim:]], axis=-1)
+        return (actions + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+
 
 def resize_with_pad_np(image: np.ndarray, height: int, width: int) -> np.ndarray:
     """Resize image to (height, width) with letterbox padding. Input: [H, W, C] uint8 or float."""
-    import cv2
+    from PIL import Image as PILImage
 
     cur_h, cur_w = image.shape[:2]
     ratio = max(cur_w / width, cur_h / height)
@@ -49,12 +80,13 @@ def resize_with_pad_np(image: np.ndarray, height: int, width: int) -> np.ndarray
     is_float = np.issubdtype(image.dtype, np.floating)
 
     if is_float:
-        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        resized = np.clip(resized, -1.0, 1.0)
+        img_u8 = np.clip((image + 1.0) / 2.0 * 255, 0, 255).astype(np.uint8)
+        pil = PILImage.fromarray(img_u8).resize((new_w, new_h), PILImage.BILINEAR)
+        resized = np.array(pil).astype(np.float32) / 255.0 * 2.0 - 1.0
         pad_val = -1.0
     else:
-        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        resized = np.clip(resized, 0, 255).astype(np.uint8)
+        pil = PILImage.fromarray(image).resize((new_w, new_h), PILImage.BILINEAR)
+        resized = np.array(pil)
         pad_val = 0
 
     pad_h0 = (height - new_h) // 2
@@ -112,9 +144,45 @@ class Tokenizer:
         return np.asarray(tokens, dtype=np.int64), np.asarray(mask, dtype=np.bool_)
 
 
-def preprocess_observation(obs: dict, tokenizer: Tokenizer) -> dict:
+def _decode_numpy(obj):
+    """Manually decode a msgpack-serialized numpy dict.
+
+    Handles two conventions:
+      - msgpack_numpy: keys  b'nd', b'type', b'kind', b'shape', b'data'
+      - openpi_client: keys  b'__ndarray__', b'dtype', b'shape', b'data'
+    """
+    d = {(k if isinstance(k, bytes) else k.encode()): v for k, v in obj.items()}
+
+    if b'__ndarray__' in d:
+        dtype_str = d[b'dtype']
+    elif b'type' in d:
+        dtype_str = d[b'type']
+    else:
+        dtype_str = d.get(b'dtype', 'float32')
+
+    if isinstance(dtype_str, bytes):
+        dtype_str = dtype_str.decode()
+    shape = tuple(d[b'shape'])
+    return np.ndarray(buffer=d[b'data'], dtype=np.dtype(dtype_str), shape=shape)
+
+
+def _ensure_array(val, fallback_shape=None):
+    """Convert val to numpy array, handling both numpy arrays and msgpack dicts."""
+    if isinstance(val, np.ndarray):
+        return val
+    if isinstance(val, dict) and any(k in val for k in (b'nd', 'nd', b'__ndarray__', '__ndarray__')):
+        return _decode_numpy(val)
+    if fallback_shape is not None:
+        return np.zeros(fallback_shape, dtype=np.float32)
+    return np.asarray(val)
+
+
+def preprocess_observation(obs: dict, tokenizer: Tokenizer, normalizer: QuantileNormalizer | None = None) -> dict:
     """Convert raw observation dict to TRT-ready numpy arrays."""
-    state = np.asarray(obs.get("observation/state", np.zeros(ACTION_DIM)), dtype=np.float32)
+    state = np.asarray(_ensure_array(obs.get("observation/state"), fallback_shape=(ACTION_DIM,)), dtype=np.float32)
+
+    if normalizer is not None:
+        state = normalizer.normalize_state(state)
 
     prompt = obs.get("prompt", "pick up the cube")
     tokens, token_mask = tokenizer.tokenize(prompt, state=state)
@@ -127,7 +195,7 @@ def preprocess_observation(obs: dict, tokenizer: Tokenizer) -> dict:
     images = {}
     for obs_key, model_key in img_keys:
         if obs_key in obs:
-            img = np.asarray(obs[obs_key])
+            img = np.asarray(_ensure_array(obs[obs_key]))
             if np.issubdtype(img.dtype, np.floating):
                 img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
             if img.shape[0] == 3:
@@ -301,18 +369,20 @@ SHARED_TENSORS = ("kv_keys", "kv_values", "prefix_pad_masks")
 class TRTPolicy:
     """Pi-0.5 policy using TRT engines with shared device buffers."""
 
-    def __init__(self, prefix_engine_path: str, denoise_engine_path: str, tokenizer_path: str):
+    def __init__(self, prefix_engine_path: str, denoise_engine_path: str, tokenizer_path: str,
+                 norm_stats_path: str | None = None):
         self.prefix_engine = TRTEngine(prefix_engine_path)
 
         shared = {name: self.prefix_engine.get_device_ptr(name) for name in SHARED_TENSORS}
         self.denoise_engine = TRTEngine(denoise_engine_path, shared_device_buffers=shared)
 
         self.tokenizer = Tokenizer(tokenizer_path)
+        self.normalizer = QuantileNormalizer(norm_stats_path) if norm_stats_path else None
         log.info("Shared device buffers for: %s", list(shared.keys()))
 
     def infer(self, obs: dict) -> dict:
         start = time.monotonic()
-        inputs = preprocess_observation(obs, self.tokenizer)
+        inputs = preprocess_observation(obs, self.tokenizer, self.normalizer)
 
         self.prefix_engine.infer(
             {
@@ -347,11 +417,14 @@ class TRTPolicy:
             t += t_step
 
         infer_ms = (time.monotonic() - start) * 1000
-        actions = x_t[0]
+        actions = x_t[0, :, :ACTION_DIM]
+
+        if self.normalizer is not None:
+            actions = self.normalizer.unnormalize_actions(actions)
 
         return {
             "state": inputs["state"][0],
-            "actions": actions[:, :ACTION_DIM],
+            "actions": actions,
             "policy_timing": {"infer_ms": infer_ms},
         }
 
@@ -386,14 +459,15 @@ class TRTWebSocketServer:
 
     async def _handler(self, websocket: ws_server.ServerConnection):
         log.info("Connection from %s", websocket.remote_address)
-        packer = msgpack_numpy.Packer()
+        packer = MsgPacker()
         await websocket.send(packer.pack(self._policy.metadata))
 
         prev_total_time = None
         while True:
             try:
                 start_time = time.monotonic()
-                obs = msgpack_numpy.unpackb(await websocket.recv())
+                raw_bytes = await websocket.recv()
+                obs = msg_unpackb(raw_bytes)
 
                 infer_start = time.monotonic()
                 action = self._policy.infer(obs)
@@ -437,6 +511,8 @@ def main():
     parser.add_argument("--tokenizer-path",
                         default=str(pathlib.Path.home() / ".cache/openpi/big_vision/paligemma_tokenizer.model"),
                         help="Path to PaliGemma sentencepiece model")
+    parser.add_argument("--norm-stats", default=None,
+                        help="Path to norm_stats.json (quantile normalization)")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", default="0.0.0.0")
     args = parser.parse_args()
@@ -450,7 +526,14 @@ def main():
         denoise_path = str(engine_dir / f"denoise_step_{args.precision}.engine")
         log.info("Using %s precision engines from %s", args.precision.upper(), engine_dir)
 
-    policy = TRTPolicy(prefix_path, denoise_path, args.tokenizer_path)
+    norm_stats_path = args.norm_stats
+    if norm_stats_path is None:
+        default_path = pathlib.Path("checkpoints/runC_pytorch/assets/verm11/runA/norm_stats.json")
+        if default_path.exists():
+            norm_stats_path = str(default_path)
+            log.info("Auto-detected norm stats: %s", norm_stats_path)
+
+    policy = TRTPolicy(prefix_path, denoise_path, args.tokenizer_path, norm_stats_path=norm_stats_path)
     server = TRTWebSocketServer(policy, host=args.host, port=args.port)
 
     log.info("Warming up with dummy inference...")

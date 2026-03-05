@@ -1087,6 +1087,15 @@ _CONFIGS = [
     #
     # Fine-tuning SO-100 joystick configs.
     #
+    # PyTorch training: these configs use a JAX weight_loader for the pretrained base.
+    # For train_pytorch.py, you must first convert the base checkpoint and pass
+    # --pytorch_weight_path, e.g.:
+    #   python examples/convert_jax_model_to_pytorch.py \
+    #     --checkpoint_dir gs://openpi-assets/checkpoints/pi05_base \
+    #     --config_name pi05_so100_lora_v3 --output_path ./checkpoints/pi05_base_pytorch
+    #   python scripts/train_pytorch.py pi05_so100_lora_v3 \
+    #     --pytorch_weight_path ./checkpoints/pi05_base_pytorch --exp_name myrun
+    #
     TrainConfig(
         name="pi05_so100_lora",
         model=pi0_config.Pi0Config(

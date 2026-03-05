@@ -44,6 +44,7 @@ import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+import openpi.training.weight_loaders as weight_loaders
 
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
@@ -442,15 +443,14 @@ def _apply_manual_fake_quant(model: torch.nn.Module):
             all_frozen = all(not p.requires_grad for p in module.parameters())
             if all_frozen:
                 fq = default_weight_fake_quant()
-                original_forward = module.forward
 
-                def make_fq_forward(mod, fq_node):
+                def make_fq_forward(mod, fq_node, orig_forward):
                     def fq_forward(x):
                         mod.weight.data = fq_node(mod.weight.data)
-                        return original_forward(x)
+                        return orig_forward(x)
                     return fq_forward
 
-                module.forward = make_fq_forward(module, fq)
+                module.forward = make_fq_forward(module, fq, module.forward)
                 count += 1
 
     logging.info(f"Applied manual fake quantization to {count} frozen Linear layers")
@@ -544,6 +544,27 @@ def train_loop(config: _config.TrainConfig):
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
         safetensors.torch.load_model(model, model_path)
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+    elif not resuming:
+        has_jax_loader = (
+            hasattr(config, "weight_loader")
+            and config.weight_loader is not None
+            and not isinstance(config.weight_loader, weight_loaders.NoOpWeightLoader)
+        )
+        if has_jax_loader:
+            logging.error(
+                "WARNING: This config has a JAX weight_loader (%s) but no pytorch_weight_path is set. "
+                "The model will start from RANDOM weights. To fix this:\n"
+                "  1. Convert the JAX checkpoint to PyTorch:\n"
+                "     python examples/convert_jax_model_to_pytorch.py "
+                "--checkpoint_dir <jax_ckpt> --config_name %s --output_path <output>\n"
+                "  2. Pass --pytorch_weight_path <output> when training.",
+                type(config.weight_loader).__name__,
+                config.name,
+            )
+            raise RuntimeError(
+                "pytorch_weight_path is required for fresh training when the config uses pretrained base weights. "
+                "See error above for instructions."
+            )
 
     if is_main and torch.cuda.is_available():
         log_memory_usage(device, 0, "after_model_creation")
