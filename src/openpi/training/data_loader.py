@@ -178,13 +178,15 @@ def create_torch_dataset(
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
 
-    # Bypass strict timestamp validation for datasets with sync issues.
+    _noop = lambda *a, **kw: None
     try:
         from lerobot.common.datasets import utils as _lerobot_utils
-        _orig_check = getattr(_lerobot_utils, "check_timestamps_sync", None)
-        if _orig_check is not None:
-            _lerobot_utils.check_timestamps_sync = lambda *a, **kw: None
-            logging.info("Patched out LeRobot timestamp sync check")
+        from lerobot.common.datasets import lerobot_dataset as _lr_ds_mod
+        if getattr(_lerobot_utils, "check_timestamps_sync", None) is not None:
+            _lerobot_utils.check_timestamps_sync = _noop
+        if getattr(_lr_ds_mod, "check_timestamps_sync", None) is not None:
+            _lr_ds_mod.check_timestamps_sync = _noop
+        logging.info("Patched out LeRobot timestamp sync check")
     except Exception:
         pass
 
