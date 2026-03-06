@@ -57,7 +57,14 @@ class TransformedDataset(Dataset[T_co]):
         self._transform = _transforms.compose(transforms)
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
-        return self._transform(self._dataset[index])
+        import random
+        for attempt in range(10):
+            try:
+                return self._transform(self._dataset[index])
+            except (RuntimeError, AssertionError) as e:
+                if attempt == 9:
+                    raise
+                index = random.randint(0, len(self._dataset) - 1)
 
     def __len__(self) -> int:
         return len(self._dataset)
