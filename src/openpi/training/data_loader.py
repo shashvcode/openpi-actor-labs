@@ -191,6 +191,22 @@ def create_torch_dataset(
     except Exception:
         pass
 
+    try:
+        from lerobot.common.datasets import video_utils as _vid_utils
+        _orig_decode = getattr(_vid_utils, "decode_video_frames_torchcodec", None)
+        if _orig_decode is not None:
+            import functools
+
+            @functools.wraps(_orig_decode)
+            def _relaxed_decode(video_path, timestamps, tolerance_s, *args, **kwargs):
+                return _orig_decode(video_path, timestamps, max(tolerance_s, 0.04), *args, **kwargs)
+
+            _vid_utils.decode_video_frames_torchcodec = _relaxed_decode
+            _lr_ds_mod.decode_video_frames = _vid_utils.decode_video_frames
+            logging.info("Relaxed video frame timestamp tolerance to 0.04s")
+    except Exception:
+        pass
+
     ds_kwargs = dict(
         repo_id=data_config.repo_id,
         delta_timestamps={
