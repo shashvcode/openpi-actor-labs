@@ -209,18 +209,17 @@ def create_torch_dataset(
         logging.info("Filtering to %d episodes", len(data_config.episode_indices))
 
     root = pathlib.Path(dataset_meta.root)
-    available_ep = None
 
+    parquet_eps: set[int] | None = None
     data_path_tmpl = dataset_meta.info.get("data_path", "")
     if data_path_tmpl:
         parquet_eps = set()
         for chunk_dir in sorted((root / "data").glob("chunk-*")):
             for p in chunk_dir.glob("episode_*.parquet"):
                 parquet_eps.add(int(p.stem.replace("episode_", "")))
-        if parquet_eps:
-            available_ep = parquet_eps
-            logging.info("Found %d episodes with parquet files", len(parquet_eps))
+        logging.info("Found %d episodes with parquet files on disk", len(parquet_eps))
 
+    video_eps: set[int] | None = None
     video_keys = [k for k, v in dataset_meta.features.items() if v.get("dtype") == "video"]
     if video_keys:
         vid_key = video_keys[0]
@@ -231,22 +230,22 @@ def create_torch_dataset(
             if cam_dir.exists():
                 for p in cam_dir.glob("episode_*.mp4"):
                     video_eps.add(int(p.stem.replace("episode_", "")))
-        if video_eps:
-            available_ep = video_eps if available_ep is None else (available_ep & video_eps)
-            logging.info("Found %d episodes with video for %s", len(video_eps), vid_key)
+        logging.info("Found %d episodes with video for %s on disk", len(video_eps), vid_key)
 
-    if available_ep is not None:
-        all_ep = set(range(dataset_meta.total_episodes))
-        missing = sorted(all_ep - available_ep)
-        if missing:
-            logging.warning("Skipping %d episodes missing data/video: %s%s",
-                            len(missing), missing[:10],
-                            "..." if len(missing) > 10 else "")
-            if "episodes" in ds_kwargs:
-                ds_kwargs["episodes"] = sorted(set(ds_kwargs["episodes"]) & available_ep)
-            else:
-                ds_kwargs["episodes"] = sorted(available_ep)
-            logging.info("Using %d episodes with both parquet and video", len(ds_kwargs["episodes"]))
+    available_ep: set[int] | None = None
+    if parquet_eps is not None and video_eps is not None:
+        available_ep = parquet_eps & video_eps
+    elif parquet_eps is not None:
+        available_ep = parquet_eps
+    elif video_eps is not None:
+        available_ep = video_eps
+
+    if available_ep is not None and len(available_ep) > 0:
+        if len(available_ep) < dataset_meta.total_episodes:
+            logging.warning("Only %d of %d declared episodes have all required files locally",
+                            len(available_ep), dataset_meta.total_episodes)
+        ds_kwargs["episodes"] = sorted(available_ep)
+        logging.info("Using %d episodes with complete local data", len(ds_kwargs["episodes"]))
 
     dataset = lerobot_dataset.LeRobotDataset(**ds_kwargs)
 
@@ -257,11 +256,12 @@ def create_torch_dataset(
     if hasattr(dataset, "episode_data_index") and "episodes" in ds_kwargs:
         edi = dataset.episode_data_index
         current_size = edi["from"].shape[0]
-        max_ep_in_data = int(dataset.hf_dataset["episode_index"][-1]) + 1 if len(dataset.hf_dataset) > 0 else 0
+        ep_col = dataset.hf_dataset["episode_index"]
+        max_ep_in_data = int(max(ep_col)) + 1 if len(ep_col) > 0 else 0
         if max_ep_in_data > current_size:
-            ep_indices_in_data = sorted(set(int(e) for e in dataset.hf_dataset["episode_index"]))
-            new_from = torch.full((max_ep_in_data,), -1, dtype=edi["from"].dtype)
-            new_to = torch.full((max_ep_in_data,), -1, dtype=edi["to"].dtype)
+            ep_indices_in_data = sorted(set(int(e) for e in ep_col))
+            new_from = torch.full((max_ep_in_data,), 0, dtype=edi["from"].dtype)
+            new_to = torch.full((max_ep_in_data,), 0, dtype=edi["to"].dtype)
             for pos, ep_idx in enumerate(ep_indices_in_data):
                 if pos < current_size:
                     new_from[ep_idx] = edi["from"][pos]
