@@ -190,12 +190,17 @@ def create_torch_dataset(
     except Exception:
         pass
 
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
+    ds_kwargs = dict(
+        repo_id=data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+    if data_config.episode_indices is not None:
+        ds_kwargs["episodes"] = list(data_config.episode_indices)
+        logging.info("Filtering to %d episodes", len(data_config.episode_indices))
+
+    dataset = lerobot_dataset.LeRobotDataset(**ds_kwargs)
 
     _patch_image_transform(dataset, dataset_meta)
 
