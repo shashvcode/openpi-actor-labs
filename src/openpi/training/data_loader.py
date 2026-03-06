@@ -61,7 +61,7 @@ class TransformedDataset(Dataset[T_co]):
         for attempt in range(10):
             try:
                 return self._transform(self._dataset[index])
-            except (RuntimeError, AssertionError) as e:
+            except Exception:
                 if attempt == 9:
                     raise
                 index = random.randint(0, len(self._dataset) - 1)
@@ -253,6 +253,22 @@ def create_torch_dataset(
     if hasattr(dataset, "tolerance_s"):
         dataset.tolerance_s = 0.04
         logging.info("Relaxed dataset video tolerance_s to 0.04s")
+
+    if hasattr(dataset, "episode_data_index") and "episodes" in ds_kwargs:
+        edi = dataset.episode_data_index
+        current_size = edi["from"].shape[0]
+        max_ep_in_data = int(dataset.hf_dataset["episode_index"][-1]) + 1 if len(dataset.hf_dataset) > 0 else 0
+        if max_ep_in_data > current_size:
+            ep_indices_in_data = sorted(set(int(e) for e in dataset.hf_dataset["episode_index"]))
+            new_from = torch.full((max_ep_in_data,), -1, dtype=edi["from"].dtype)
+            new_to = torch.full((max_ep_in_data,), -1, dtype=edi["to"].dtype)
+            for pos, ep_idx in enumerate(ep_indices_in_data):
+                if pos < current_size:
+                    new_from[ep_idx] = edi["from"][pos]
+                    new_to[ep_idx] = edi["to"][pos]
+            dataset.episode_data_index = {"from": new_from, "to": new_to}
+            logging.info("Remapped episode_data_index from %d to %d entries for non-contiguous episodes",
+                         current_size, max_ep_in_data)
 
     _patch_image_transform(dataset, dataset_meta)
 
