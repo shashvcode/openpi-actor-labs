@@ -201,27 +201,45 @@ def create_torch_dataset(
         ds_kwargs["episodes"] = list(data_config.episode_indices)
         logging.info("Filtering to %d episodes", len(data_config.episode_indices))
 
+    root = pathlib.Path(dataset_meta.root)
+    available_ep = None
+
+    data_path_tmpl = dataset_meta.info.get("data_path", "")
+    if data_path_tmpl:
+        parquet_eps = set()
+        for chunk_dir in sorted((root / "data").glob("chunk-*")):
+            for p in chunk_dir.glob("episode_*.parquet"):
+                parquet_eps.add(int(p.stem.replace("episode_", "")))
+        if parquet_eps:
+            available_ep = parquet_eps
+            logging.info("Found %d episodes with parquet files", len(parquet_eps))
+
     video_keys = [k for k, v in dataset_meta.features.items() if v.get("dtype") == "video"]
     if video_keys:
         vid_key = video_keys[0]
-        vid_root = pathlib.Path(dataset_meta.root) / "videos"
-        available = set()
+        vid_root = root / "videos"
+        video_eps = set()
         for chunk_dir in sorted(vid_root.glob("chunk-*")):
             cam_dir = chunk_dir / vid_key
             if cam_dir.exists():
                 for p in cam_dir.glob("episode_*.mp4"):
-                    available.add(int(p.stem.replace("episode_", "")))
-        if available:
-            all_ep = set(range(dataset_meta.total_episodes))
-            missing = sorted(all_ep - available)
-            if missing:
-                logging.warning("Skipping %d episodes without video for %s: %s",
-                                len(missing), vid_key, missing[:20])
-                if "episodes" in ds_kwargs:
-                    ds_kwargs["episodes"] = sorted(set(ds_kwargs["episodes"]) & available)
-                else:
-                    ds_kwargs["episodes"] = sorted(available)
-                logging.info("Using %d episodes with video", len(ds_kwargs["episodes"]))
+                    video_eps.add(int(p.stem.replace("episode_", "")))
+        if video_eps:
+            available_ep = video_eps if available_ep is None else (available_ep & video_eps)
+            logging.info("Found %d episodes with video for %s", len(video_eps), vid_key)
+
+    if available_ep is not None:
+        all_ep = set(range(dataset_meta.total_episodes))
+        missing = sorted(all_ep - available_ep)
+        if missing:
+            logging.warning("Skipping %d episodes missing data/video: %s%s",
+                            len(missing), missing[:10],
+                            "..." if len(missing) > 10 else "")
+            if "episodes" in ds_kwargs:
+                ds_kwargs["episodes"] = sorted(set(ds_kwargs["episodes"]) & available_ep)
+            else:
+                ds_kwargs["episodes"] = sorted(available_ep)
+            logging.info("Using %d episodes with both parquet and video", len(ds_kwargs["episodes"]))
 
     dataset = lerobot_dataset.LeRobotDataset(**ds_kwargs)
 
