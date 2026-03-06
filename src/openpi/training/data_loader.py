@@ -2,6 +2,7 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -199,6 +200,28 @@ def create_torch_dataset(
     if data_config.episode_indices is not None:
         ds_kwargs["episodes"] = list(data_config.episode_indices)
         logging.info("Filtering to %d episodes", len(data_config.episode_indices))
+
+    video_keys = [k for k, v in dataset_meta.features.items() if v.get("dtype") == "video"]
+    if video_keys:
+        vid_key = video_keys[0]
+        vid_root = pathlib.Path(dataset_meta.root) / "videos"
+        available = set()
+        for chunk_dir in sorted(vid_root.glob("chunk-*")):
+            cam_dir = chunk_dir / vid_key
+            if cam_dir.exists():
+                for p in cam_dir.glob("episode_*.mp4"):
+                    available.add(int(p.stem.replace("episode_", "")))
+        if available:
+            all_ep = set(range(dataset_meta.total_episodes))
+            missing = sorted(all_ep - available)
+            if missing:
+                logging.warning("Skipping %d episodes without video for %s: %s",
+                                len(missing), vid_key, missing[:20])
+                if "episodes" in ds_kwargs:
+                    ds_kwargs["episodes"] = sorted(set(ds_kwargs["episodes"]) & available)
+                else:
+                    ds_kwargs["episodes"] = sorted(available)
+                logging.info("Using %d episodes with video", len(ds_kwargs["episodes"]))
 
     dataset = lerobot_dataset.LeRobotDataset(**ds_kwargs)
 
