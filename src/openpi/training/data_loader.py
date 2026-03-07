@@ -184,9 +184,20 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-
     _noop = lambda *a, **kw: None
+    try:
+        from lerobot.common.datasets import compute_stats as _compute_stats
+        _orig_aggregate = _compute_stats.aggregate_stats
+        def _safe_aggregate(stats_list):
+            try:
+                return _orig_aggregate(stats_list)
+            except (AttributeError, TypeError):
+                logging.warning("episodes_stats.jsonl format mismatch, skipping stats aggregation")
+                return {}
+        _compute_stats.aggregate_stats = _safe_aggregate
+    except Exception:
+        pass
+
     try:
         from lerobot.common.datasets import utils as _lerobot_utils
         from lerobot.common.datasets import lerobot_dataset as _lr_ds_mod
@@ -197,6 +208,8 @@ def create_torch_dataset(
         logging.info("Patched out LeRobot timestamp sync check")
     except Exception:
         pass
+
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
 
     ds_kwargs = dict(
         repo_id=data_config.repo_id,
