@@ -490,7 +490,7 @@ class LeRobotSO100DepthGridDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotExcavatorDataConfig(DataConfigFactory):
-    """Config for excavator joystick control data. Actions are joystick commands (4 dims)."""
+    """Config for excavator joystick control data. 4-dim joystick, 2 cameras (cab + side)."""
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -499,6 +499,7 @@ class LeRobotExcavatorDataConfig(DataConfigFactory):
                 _transforms.RepackTransform(
                     {
                         "observation/image_cab": "observation.images.csi_0_imx219",
+                        "observation/image_side": "observation.images.usb_0",
                         "observation/state": "observation.state",
                         "actions": "action",
                         "prompt": "prompt",
@@ -1261,7 +1262,7 @@ _CONFIGS = [
     # Excavator joystick configs.
     #
     TrainConfig(
-        name="pi05_excavator_lora",
+        name="pi05_excavator_v2",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=4,
@@ -1270,7 +1271,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotExcavatorDataConfig(
-            repo_id="verm11/excavator-teleop",
+            repo_id="verm11/excavator_v2",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
