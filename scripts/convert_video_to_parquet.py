@@ -29,11 +29,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 
-def decode_video_frames(video_path: pathlib.Path) -> list[bytes]:
-    """Decode all frames from a video file and return as JPEG bytes."""
+def decode_video_frames(video_path: pathlib.Path) -> list[bytes] | None:
+    """Decode all frames from a video file and return as JPEG bytes. Returns None if video is corrupted."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video: {video_path}")
+        return None
 
     frames = []
     while True:
@@ -44,7 +44,7 @@ def decode_video_frames(video_path: pathlib.Path) -> list[bytes]:
         frames.append(jpeg.tobytes())
 
     cap.release()
-    return frames
+    return frames if frames else None
 
 
 def main():
@@ -119,14 +119,23 @@ def main():
         n_rows = len(table)
 
         cam_frames = {}
+        skip = False
         for cam_key in args.camera_keys:
             chunk_idx = orig_ep_idx // args.chunks_size
             video_path = videos_dir / f"chunk-{chunk_idx:03d}" / cam_key / f"episode_{orig_ep_idx:06d}.mp4"
             if not video_path.exists():
                 log.warning("Skipping episode %d: missing video %s", orig_ep_idx, video_path)
-                cam_frames = None
+                skip = True
                 break
             frames = decode_video_frames(video_path)
+            if frames is None:
+                log.warning("Skipping episode %d: corrupted video %s", orig_ep_idx, video_path)
+                skip = True
+                break
+            if len(frames) < 20:
+                log.warning("Skipping episode %d: only %d video frames (too short)", orig_ep_idx, len(frames))
+                skip = True
+                break
             if len(frames) < n_rows:
                 log.warning("Episode %d: video has %d frames but parquet has %d rows, truncating parquet",
                             orig_ep_idx, len(frames), n_rows)
@@ -135,7 +144,7 @@ def main():
                 frames = frames[:n_rows]
             cam_frames[cam_key] = frames
 
-        if cam_frames is None:
+        if skip:
             continue
 
         cols = table.to_pydict()
