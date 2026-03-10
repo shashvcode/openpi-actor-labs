@@ -25,18 +25,15 @@ Cameras (cab CSI + side USB) are on Pi #2 (192.168.1.83).  Two options:
 
     # On workstation:
     python run_policy.py \\
-        --cab-cam-url http://192.168.1.83:8081/frame/csi_0_imx219 \\
-        --side-cam-url http://192.168.1.83:8081/frame/usb_0 \\
-        --host localhost --port 8000
+        --host wss://<runpod-proxy-url> \\
+        --cab-cam-url http://192.168.1.83:8080/frame/csi_0_imx219 \\
+        --side-cam-url http://192.168.1.83:8080/frame/usb_0 \\
+        --no-ssh
 
   Option B — Run this script directly on Pi #2 (cameras are local):
-    # On workstation, bind SSH tunnel to all interfaces so Pi #2 can reach it:
-    ssh -L 0.0.0.0:8000:localhost:8000 <runpod-host>
-
-    # On Pi #2:
     python run_policy.py \\
         --cab-cam 0 --side-cam 2 \\
-        --host 192.168.1.x --port 8000
+        --host wss://<runpod-proxy-url>
 
 Usage
 -----
@@ -45,26 +42,32 @@ Usage
         --policy.config pi05_excavator_v2 \\
         --policy.dir checkpoints/pi05_excavator_v2/run1/14999
 
-    # 2. Set up SSH tunnel from workstation to the cloud GPU:
-    ssh -L 8000:localhost:8000 <runpod-host>
-
-    # 3a. Stream cameras from Pi #2 (see "Camera Setup" above), OR
-    # 3b. Run directly on Pi #2 with local cameras.
+    # 2. Run inference (uses RunPod proxy URL directly — no SSH tunnel needed):
+    python run_policy.py --host wss://<pod-id>-8000.proxy.runpod.net \\
+        --cab-cam-url http://192.168.1.83:8080/frame/csi_0_imx219 \\
+        --side-cam-url http://192.168.1.83:8080/frame/usb_0 \\
+        --no-ssh
 
     # Dry run (no Pi connection, prints predicted actions):
-    python run_policy.py --host localhost --port 8000 \\
+    python run_policy.py --host wss://<pod-id>-8000.proxy.runpod.net \\
         --dry-run --cab-cam 0 --side-cam 1
 """
 
 import argparse
+import io
 import logging
+import os
+import select
 import signal
 import socket
 import subprocess
 import sys
+import termios
 import threading
 import time
+import tty
 import urllib.request
+import wave
 
 import cv2
 import numpy as np
@@ -77,17 +80,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 ACTION_DIM = 4
-CONTROL_HZ = 10        # action execution rate — matches training data (10 FPS video)
-UDP_SEND_HZ = 50       # UDP packet rate to keep Pi watchdog fed (0.5 s timeout)
-MODEL_IMG_SIZE = 224    # model expects 224x224 images
+CONTROL_HZ = 10
+UDP_SEND_HZ = 50
+MODEL_IMG_SIZE = 224
 CAM_W, CAM_H = 640, 480
 
 PI_HOST_DEFAULT = "192.168.1.72"
 PI_PORT_DEFAULT = 9000
 PI_USER_DEFAULT = "actor"
 
-# pi_receiver.py launch command with all servo-tuning parameters.
-# Changing these requires restarting this script (which re-SSHs into the Pi).
 PI_RECEIVER_CMD = (
     "python3 /home/actor/pi_receiver.py"
     " --output-mode servokit"
@@ -150,7 +151,6 @@ class ServoUDPSender:
         logger.info("UDP sender started -> %s:%d at %d Hz", pi_host, pi_port, UDP_SEND_HZ)
 
     def set_axes(self, lx: float, ly: float, rx: float, ry: float):
-        """Update the target axis values (clamped to [-1, +1])."""
         with self._lock:
             self._lx = float(np.clip(lx, -1.0, 1.0))
             self._ly = float(np.clip(ly, -1.0, 1.0))
@@ -158,7 +158,6 @@ class ServoUDPSender:
             self._ry = float(np.clip(ry, -1.0, 1.0))
 
     def set_estop(self):
-        """Activate emergency stop: zero all axes and set the estop flag."""
         with self._lock:
             self._estop = True
             self._lx = self._ly = self._rx = self._ry = 0.0
@@ -202,7 +201,6 @@ class ServoUDPSender:
 # ---------------------------------------------------------------------------
 
 def launch_pi_receiver(pi_host: str, pi_user: str = PI_USER_DEFAULT):
-    """Kill any existing pi_receiver.py on the Pi and start a fresh instance."""
     ssh_target = f"{pi_user}@{pi_host}"
 
     logger.info("Killing existing pi_receiver.py on %s ...", pi_host)
@@ -232,7 +230,6 @@ def launch_pi_receiver(pi_host: str, pi_user: str = PI_USER_DEFAULT):
 
 
 def kill_pi_receiver(pi_host: str, pi_user: str = PI_USER_DEFAULT):
-    """Cleanly stop pi_receiver.py on the Pi."""
     ssh_target = f"{pi_user}@{pi_host}"
     logger.info("Stopping pi_receiver.py on %s ...", pi_host)
     subprocess.run(
@@ -242,16 +239,182 @@ def kill_pi_receiver(pi_host: str, pi_user: str = PI_USER_DEFAULT):
 
 
 # ---------------------------------------------------------------------------
+# Speech-to-text — push-to-talk via OpenAI Whisper API
+# ---------------------------------------------------------------------------
+
+class SpeechPrompt:
+    """Records microphone audio and transcribes via OpenAI Whisper API."""
+
+    SAMPLE_RATE = 16000
+    CHANNELS = 1
+
+    def __init__(self, api_key: str):
+        import openai
+        self._client = openai.OpenAI(api_key=api_key)
+        self._recording = False
+        self._frames: list[np.ndarray] = []
+        self._stream = None
+
+    def start_recording(self):
+        import sounddevice as sd
+        self._frames = []
+        self._recording = True
+        self._stream = sd.InputStream(
+            samplerate=self.SAMPLE_RATE,
+            channels=self.CHANNELS,
+            dtype="int16",
+            callback=self._audio_callback,
+        )
+        self._stream.start()
+        logger.info(">>> RECORDING — speak your command. Press T again to stop.")
+
+    def _audio_callback(self, indata, frames, time_info, status):
+        if self._recording:
+            self._frames.append(indata.copy())
+
+    def stop_and_transcribe(self) -> str:
+        self._recording = False
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+
+        if not self._frames:
+            return ""
+
+        audio_data = np.concatenate(self._frames, axis=0)
+        duration = len(audio_data) / self.SAMPLE_RATE
+        logger.info("Transcribing %.1fs of audio...", duration)
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(self.CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(self.SAMPLE_RATE)
+            wf.writeframes(audio_data.tobytes())
+        buf.seek(0)
+        buf.name = "speech.wav"
+
+        try:
+            result = self._client.audio.transcriptions.create(
+                model="whisper-1",
+                file=buf,
+            )
+            text = result.text.strip()
+            logger.info('Transcribed: "%s"', text)
+            return text
+        except Exception as exc:
+            logger.error("Whisper API error: %s", exc)
+            return ""
+
+
+# ---------------------------------------------------------------------------
+# Keyboard listener — e-stop / resume / quit / voice prompt during inference
+# ---------------------------------------------------------------------------
+
+class KeyboardController:
+    """Non-blocking keyboard listener for runtime control.
+
+    Keys:
+        SPACE  — E-STOP: zero all servos immediately
+        r      — Resume: clear e-stop, continue inference
+        t      — Push-to-talk: record speech, transcribe, update prompt
+        q      — Quit: graceful shutdown
+    """
+
+    def __init__(self, servo: ServoUDPSender | None, initial_prompt: str,
+                 openai_api_key: str | None = None):
+        self._servo = servo
+        self._estopped = False
+        self._quit = False
+        self._old_settings = None
+        self._prompt = initial_prompt
+        self._prompt_lock = threading.Lock()
+        self._speech = SpeechPrompt(openai_api_key) if openai_api_key else None
+        self._is_recording = False
+        self._thread = threading.Thread(target=self._listen, daemon=True)
+
+    @property
+    def prompt(self) -> str:
+        with self._prompt_lock:
+            return self._prompt
+
+    @property
+    def estopped(self) -> bool:
+        return self._estopped
+
+    @property
+    def quit_requested(self) -> bool:
+        return self._quit
+
+    def start(self):
+        self._old_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+        self._thread.start()
+        voice_str = "  T=Talk" if self._speech else ""
+        logger.info("Keyboard controls:  SPACE=E-STOP  R=Resume%s  Q=Quit", voice_str)
+
+    def stop(self):
+        if self._old_settings is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_settings)
+
+    def _listen(self):
+        try:
+            while not self._quit:
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    ch = sys.stdin.read(1)
+                    if ch == " ":
+                        self._estopped = True
+                        if self._servo:
+                            self._servo.set_estop()
+                        logger.warning(">>> E-STOP (space) — servos zeroed. Press R to resume.")
+                    elif ch in ("r", "R"):
+                        if self._is_recording:
+                            continue
+                        self._estopped = False
+                        if self._servo:
+                            self._servo.clear_estop()
+                        logger.info(">>> RESUMED (r) — inference continuing.")
+                    elif ch in ("t", "T"):
+                        self._handle_talk()
+                    elif ch in ("q", "Q"):
+                        self._quit = True
+                        logger.info(">>> QUIT (q) — shutting down.")
+        except Exception:
+            pass
+
+    def _handle_talk(self):
+        if self._speech is None:
+            logger.warning("Voice control disabled — no OpenAI API key. Use --openai-api-key or set OPENAI_API_KEY.")
+            return
+
+        if not self._is_recording:
+            self._estopped = True
+            if self._servo:
+                self._servo.set_estop()
+            self._is_recording = True
+            self._speech.start_recording()
+        else:
+            text = self._speech.stop_and_transcribe()
+            self._is_recording = False
+            if text:
+                with self._prompt_lock:
+                    self._prompt = text
+                logger.info('>>> NEW PROMPT: "%s"', text)
+            else:
+                logger.warning("No speech detected — keeping previous prompt.")
+            self._estopped = False
+            if self._servo:
+                self._servo.clear_estop()
+            logger.info('>>> RESUMED — inferencing with: "%s"', self.prompt)
+
+
+# ---------------------------------------------------------------------------
 # Camera source abstraction — local OpenCV or remote HTTP
 # ---------------------------------------------------------------------------
 
 class CameraSource:
-    """Unified camera access: local V4L2/USB via OpenCV, or HTTP JPEG from pi_camera_server.py.
-
-    Using HTTP snapshots (rather than OpenCV URL streaming) avoids frame
-    buffering — every call to ``grab()`` fetches the *latest* frame from the
-    Pi's camera server with no stale-buffer lag.
-    """
+    """Unified camera access: local V4L2/USB via OpenCV, or HTTP JPEG from pi_camera_server.py."""
 
     def __init__(self, source, label: str):
         self.label = label
@@ -260,7 +423,6 @@ class CameraSource:
         if self._is_http:
             self._url = source
             self._cap = None
-            # Verify the endpoint is reachable
             try:
                 resp = urllib.request.urlopen(self._url, timeout=5)
                 resp.read()
@@ -279,7 +441,6 @@ class CameraSource:
             logger.info("%s camera: local device %s, native %dx%d", label, source, actual_w, actual_h)
 
     def grab(self, size: int = MODEL_IMG_SIZE) -> np.ndarray | None:
-        """Return the latest frame as uint8 RGB array resized to size x size, or None."""
         if self._is_http:
             return self._grab_http(size)
         return self._grab_local(size)
@@ -318,16 +479,26 @@ class CameraSource:
 def run(args):
     from openpi_client import websocket_client_policy as wcp
 
-    # --- 1. Launch pi_receiver.py on the Pi via SSH ---
     if not args.dry_run and not args.no_ssh:
         launch_pi_receiver(args.pi_host, args.pi_user)
 
-    # --- 2. Start UDP sender background thread ---
     servo = None
     if not args.dry_run:
         servo = ServoUDPSender(args.pi_host, args.pi_port)
 
-    # --- 3. Connect to policy server via WebSocket ---
+    # Load .env file from project root if it exists
+    env_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
+    if os.path.isfile(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+
+    openai_key = args.openai_api_key or os.environ.get("OPENAI_API_KEY")
+    kb = KeyboardController(servo, initial_prompt=args.prompt, openai_api_key=openai_key)
+
     host_uri = args.host
     port = args.port if not host_uri.startswith("ws") else None
     logger.info("Connecting to policy server at %s:%s ...", host_uri, port)
@@ -335,13 +506,11 @@ def run(args):
     metadata = policy.get_server_metadata()
     logger.info("Server metadata: %s", metadata)
 
-    # --- 4. Open cameras (local device index or HTTP URL from pi_camera_server.py) ---
     cab_source = args.cab_cam_url if args.cab_cam_url else args.cab_cam
     side_source = args.side_cam_url if args.side_cam_url else args.side_cam
     cab_cam = CameraSource(cab_source, "cab")
     side_cam = CameraSource(side_source, "side")
 
-    # --- 5. Control loop ---
     state = np.zeros(ACTION_DIM, dtype=np.float32)
     step = 0
     target_dt = 1.0 / args.control_hz
@@ -354,16 +523,23 @@ def run(args):
 
     signal.signal(signal.SIGINT, on_signal)
 
+    kb.start()
+
     logger.info(
-        "Control loop: %d Hz action execution, %d Hz UDP to Pi. Ctrl+C to stop.",
+        "Control loop: %d Hz action execution, %d Hz UDP to Pi.",
         args.control_hz, UDP_SEND_HZ,
     )
 
     try:
-        while not shutdown:
+        while not shutdown and not kb.quit_requested:
             if args.max_steps and step >= args.max_steps:
                 logger.info("Reached max steps (%d). Stopping.", args.max_steps)
                 break
+
+            # While e-stopped, keep the loop alive but don't send any actions
+            if kb.estopped:
+                time.sleep(0.05)
+                continue
 
             cab_frame = cab_cam.grab(MODEL_IMG_SIZE)
             side_frame = side_cam.grab(MODEL_IMG_SIZE)
@@ -372,20 +548,21 @@ def run(args):
                 time.sleep(0.01)
                 continue
 
+            current_prompt = kb.prompt
             obs = {
                 "observation/state": state.copy(),
                 "observation/image_cab": cab_frame,
                 "observation/image_side": side_frame,
-                "prompt": args.prompt,
+                "prompt": current_prompt,
             }
 
             infer_start = time.perf_counter()
             result = policy.infer(obs)
             infer_ms = (time.perf_counter() - infer_start) * 1000
-            actions = result["actions"]  # shape: (action_horizon, 4)
+            actions = result["actions"]
 
             for action_idx in range(len(actions)):
-                if shutdown:
+                if shutdown or kb.quit_requested or kb.estopped:
                     break
 
                 action = actions[action_idx]
@@ -414,13 +591,15 @@ def run(args):
 
             if step % 10 == 0:
                 pkt = servo.packets_sent if servo else 0
+                estop_str = " [E-STOPPED]" if kb.estopped else ""
                 logger.info(
-                    "Step %d | infer %.0fms | action[0]: lx=%+.3f ly=%+.3f rx=%+.3f ry=%+.3f | pkts=%d",
-                    step, infer_ms, *actions[0][:ACTION_DIM], pkt,
+                    "Step %d | infer %.0fms | action[0]: lx=%+.3f ly=%+.3f rx=%+.3f ry=%+.3f | pkts=%d%s",
+                    step, infer_ms, *actions[0][:ACTION_DIM], pkt, estop_str,
                 )
 
     finally:
         logger.info("Shutting down...")
+        kb.stop()
         cab_cam.release()
         side_cam.release()
         if servo is not None:
@@ -442,7 +621,7 @@ def main():
 
     g = parser.add_argument_group("Policy server")
     g.add_argument("--host", default="localhost",
-                   help="Policy server host (default: localhost via SSH tunnel)")
+                   help="Policy server host (localhost via SSH tunnel, or wss:// RunPod proxy URL)")
     g.add_argument("--port", type=int, default=8000)
 
     g = parser.add_argument_group("Pi connection")
@@ -458,17 +637,20 @@ def main():
     g.add_argument("--cab-cam", type=int, default=0, help="Cab camera OpenCV index")
     g.add_argument("--side-cam", type=int, default=1, help="Side camera OpenCV index")
     g.add_argument("--cab-cam-url", default=None,
-                   help="Cab camera URL (RTSP/HTTP/MJPEG — overrides --cab-cam)")
+                   help="Cab camera HTTP URL (overrides --cab-cam)")
     g.add_argument("--side-cam-url", default=None,
-                   help="Side camera URL (RTSP/HTTP/MJPEG — overrides --side-cam)")
+                   help="Side camera HTTP URL (overrides --side-cam)")
 
     g = parser.add_argument_group("Task")
     g.add_argument("--prompt", default="Scoop packing peanuts from large pool and dump into small pool",
-                   help="Language instruction for the policy")
+                   help="Initial language instruction (can be changed at runtime via voice)")
+    g.add_argument("--openai-api-key", default=None,
+                   help="OpenAI API key for Whisper speech-to-text (or set OPENAI_API_KEY env var). "
+                        "Press T during inference to speak a new prompt.")
 
     g = parser.add_argument_group("Control")
     g.add_argument("--control-hz", type=int, default=CONTROL_HZ,
-                   help="Action execution rate (default: 10 Hz, matches training data)")
+                   help="Action execution rate (default: 10 Hz)")
     g.add_argument("--max-steps", type=int, default=None, help="Stop after N action steps")
     g.add_argument("--dry-run", action="store_true",
                    help="Print predicted actions without connecting to Pi")

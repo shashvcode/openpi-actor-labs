@@ -1282,8 +1282,8 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
         num_train_steps=15_000,
-        save_interval=5_000,
-        keep_period=10_000,
+        save_interval=2_500,
+        keep_period=5_000,
         batch_size=32,
     ),
     TrainConfig(
