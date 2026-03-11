@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.excavator_policy as excavator_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.so100_policy as so100_policy
 import openpi.shared.download as _download
@@ -90,6 +91,9 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # If set, only load these episode indices from the dataset.
+    episode_indices: Sequence[int] | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -471,6 +475,42 @@ class LeRobotSO100DepthGridDataConfig(DataConfigFactory):
         data_transforms = _transforms.Group(
             inputs=[so100_policy.SO100DepthGridInputs(depth_grids=depth_grids)],
             outputs=[so100_policy.SO100Outputs()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotExcavatorDataConfig(DataConfigFactory):
+    """Config for excavator joystick control data. 4-dim joystick, 2 cameras (cab + side)."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image_cab": "observation.images.csi_0_imx219",
+                        "observation/image_side": "observation.images.usb_0",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[excavator_policy.ExcavatorInputs()],
+            outputs=[excavator_policy.ExcavatorOutputs()],
         )
 
         model_transforms = ModelTransformFactory()(model_config)
@@ -1225,6 +1265,34 @@ _CONFIGS = [
         num_train_steps=15_000,
         save_interval=5_000,
         keep_period=10_000,
+        batch_size=32,
+    ),
+    #
+    # Excavator joystick configs.
+    #
+    TrainConfig(
+        name="pi05_excavator_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=4,
+            action_horizon=11,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotExcavatorDataConfig(
+            repo_id="verm11/excavator_v2",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=15_000,
+        save_interval=2_500,
+        keep_period=5_000,
         batch_size=32,
     ),
     TrainConfig(

@@ -1,0 +1,59 @@
+{
+  "codebase_version": "v2.1",
+  "robot_type": "excavator",
+  "total_episodes": 590,
+  "total_frames": 190233,
+  "fps": 10,
+  "chunks_size": 1000,
+  "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+  "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+  "splits": {
+    "train": "0:621"
+  },
+  "task": "Scoop up packing peanuts from large pool and put in to small pool",
+  "features": {
+    "observation.state": {
+      "dtype": "float32",
+      "shape": [
+        4
+      ],
+      "names": [
+        "left_x",
+        "left_y",
+        "right_x",
+        "right_y"
+      ]
+    },
+    "action": {
+      "dtype": "float32",
+      "shape": [
+        4
+      ],
+      "names": [
+        "left_x",
+        "left_y",
+        "right_x",
+        "right_y"
+      ]
+    },
+    "observation.images.csi_0_imx219": {
+      "dtype": "video",
+      "shape": [
+        3,
+        480,
+        640
+      ],
+      "names": [
+        "channels",
+        "height",
+        "width"
+      ],
+      "video_info": {
+        "video.fps": 10,
+        "video.codec": "av1",
+        "video.pix_fmt": "yuv420p",
+        "has_audio": false
+      }
+    }
+  }
+}

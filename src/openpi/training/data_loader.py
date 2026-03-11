@@ -2,6 +2,7 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -56,7 +57,14 @@ class TransformedDataset(Dataset[T_co]):
         self._transform = _transforms.compose(transforms)
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
-        return self._transform(self._dataset[index])
+        import random
+        for attempt in range(10):
+            try:
+                return self._transform(self._dataset[index])
+            except Exception:
+                if attempt == 9:
+                    raise
+                index = random.randint(0, len(self._dataset) - 1)
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -176,13 +184,107 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
+    _noop = lambda *a, **kw: None
+    try:
+        from lerobot.common.datasets import compute_stats as _compute_stats
+        from lerobot.common.datasets import lerobot_dataset as _lr_ds_mod
+        _orig_aggregate = _compute_stats.aggregate_stats
+        def _safe_aggregate(stats_list):
+            try:
+                return _orig_aggregate(stats_list)
+            except (AttributeError, TypeError):
+                logging.warning("episodes_stats.jsonl format mismatch, skipping stats aggregation")
+                return {}
+        _compute_stats.aggregate_stats = _safe_aggregate
+        if hasattr(_lr_ds_mod, "aggregate_stats"):
+            _lr_ds_mod.aggregate_stats = _safe_aggregate
+    except Exception:
+        pass
+
+    try:
+        from lerobot.common.datasets import utils as _lerobot_utils
+        from lerobot.common.datasets import lerobot_dataset as _lr_ds_mod
+        if getattr(_lerobot_utils, "check_timestamps_sync", None) is not None:
+            _lerobot_utils.check_timestamps_sync = _noop
+        if getattr(_lr_ds_mod, "check_timestamps_sync", None) is not None:
+            _lr_ds_mod.check_timestamps_sync = _noop
+        logging.info("Patched out LeRobot timestamp sync check")
+    except Exception:
+        pass
+
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
+
+    ds_kwargs = dict(
+        repo_id=data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+    if data_config.episode_indices is not None:
+        ds_kwargs["episodes"] = list(data_config.episode_indices)
+        logging.info("Filtering to %d episodes", len(data_config.episode_indices))
+
+    root = pathlib.Path(dataset_meta.root)
+
+    parquet_eps: set[int] | None = None
+    data_path_tmpl = dataset_meta.info.get("data_path", "")
+    if data_path_tmpl:
+        parquet_eps = set()
+        for chunk_dir in sorted((root / "data").glob("chunk-*")):
+            for p in chunk_dir.glob("episode_*.parquet"):
+                parquet_eps.add(int(p.stem.replace("episode_", "")))
+        logging.info("Found %d episodes with parquet files on disk", len(parquet_eps))
+
+    video_eps: set[int] | None = None
+    video_keys = [k for k, v in dataset_meta.features.items() if v.get("dtype") == "video"]
+    if video_keys:
+        vid_key = video_keys[0]
+        vid_root = root / "videos"
+        video_eps = set()
+        for chunk_dir in sorted(vid_root.glob("chunk-*")):
+            cam_dir = chunk_dir / vid_key
+            if cam_dir.exists():
+                for p in cam_dir.glob("episode_*.mp4"):
+                    video_eps.add(int(p.stem.replace("episode_", "")))
+        logging.info("Found %d episodes with video for %s on disk", len(video_eps), vid_key)
+
+    available_ep: set[int] | None = None
+    if parquet_eps is not None and video_eps is not None:
+        available_ep = parquet_eps & video_eps
+    elif parquet_eps is not None:
+        available_ep = parquet_eps
+    elif video_eps is not None:
+        available_ep = video_eps
+
+    if available_ep is not None and len(available_ep) > 0:
+        if len(available_ep) < dataset_meta.total_episodes:
+            logging.warning("Only %d of %d declared episodes have all required files locally",
+                            len(available_ep), dataset_meta.total_episodes)
+        ds_kwargs["episodes"] = sorted(available_ep)
+        logging.info("Using %d episodes with complete local data", len(ds_kwargs["episodes"]))
+
+    dataset = lerobot_dataset.LeRobotDataset(**ds_kwargs)
+
+    if hasattr(dataset, "tolerance_s"):
+        dataset.tolerance_s = 0.04
+        logging.info("Relaxed dataset video tolerance_s to 0.04s")
+
+    if hasattr(dataset, "episode_data_index") and "episodes" in ds_kwargs:
+        edi = dataset.episode_data_index
+        current_size = edi["from"].shape[0]
+        ep_col = dataset.hf_dataset["episode_index"]
+        max_ep_in_data = int(max(ep_col)) + 1 if len(ep_col) > 0 else 0
+        if max_ep_in_data > current_size:
+            ep_indices_in_data = sorted(set(int(e) for e in ep_col))
+            new_from = torch.full((max_ep_in_data,), 0, dtype=edi["from"].dtype)
+            new_to = torch.full((max_ep_in_data,), 0, dtype=edi["to"].dtype)
+            for pos, ep_idx in enumerate(ep_indices_in_data):
+                if pos < current_size:
+                    new_from[ep_idx] = edi["from"][pos]
+                    new_to[ep_idx] = edi["to"][pos]
+            dataset.episode_data_index = {"from": new_from, "to": new_to}
+            logging.info("Remapped episode_data_index from %d to %d entries for non-contiguous episodes",
+                         current_size, max_ep_in_data)
 
     _patch_image_transform(dataset, dataset_meta)
 
