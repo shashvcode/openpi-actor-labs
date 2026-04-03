@@ -168,3 +168,20 @@ cython_debug/
 #.idea/
 
 so100_merged/
+
+# Large binary artifacts (TRT engines, ONNX models, calibration data)
+onnx_export/
+calibration_data/
+calibration_data_fresh/
+*.engine
+*.onnx
+*.npz
+*.cache
+
+# Snapshot/debug images
+*.jpg
+!excavator_cams/*.jpg
+!cam_0.jpg
+!cam_1.jpg
+!cam_2.jpg
+!cam_3.jpg

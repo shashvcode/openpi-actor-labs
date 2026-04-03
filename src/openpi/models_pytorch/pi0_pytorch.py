@@ -75,7 +75,7 @@ def make_att_2d_masks(pad_masks, att_masks):
     if pad_masks.ndim != 2:
         raise ValueError(pad_masks.ndim)
 
-    cumsum = torch.cumsum(att_masks, dim=1)
+    cumsum = torch.cumsum(att_masks.to(torch.int32), dim=1)
     att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
     pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
     return att_2d_masks & pad_2d_masks
@@ -86,6 +86,8 @@ class PI0Pytorch(nn.Module):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
+        self._attn_impl = getattr(config, 'attn_impl', 'eager')
+        self._compile_mode = getattr(config, 'compile_mode', 'reduce-overhead')
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -110,7 +112,7 @@ class PI0Pytorch(nn.Module):
 
         torch.set_float32_matmul_precision("high")
 
-        self.denoise_step = torch.compile(self.denoise_step, mode="reduce-overhead")
+        self.denoise_step = torch.compile(self.denoise_step, mode=self._compile_mode)
 
         self.gradient_checkpointing_enabled = False
 
@@ -154,9 +156,14 @@ class PI0Pytorch(nn.Module):
         return func(*args, **kwargs)
 
     def _prepare_attention_masks_4d(self, att_2d_masks):
-        """Helper method to prepare 4D attention masks for transformer."""
+        """Helper method to prepare 4D attention masks for transformer.
+
+        Uses -65504 (FP16 min finite) as the fill value instead of -2.38e38
+        to prevent NaN propagation when running in FP16 TensorRT engines.
+        The original -2.38e38 overflows FP16 (max 65504) → -inf → NaN in attention.
+        """
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+        return torch.where(att_2d_masks_4d, 0.0, -65504.0)
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
@@ -340,7 +347,7 @@ class PI0Pytorch(nn.Module):
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        position_ids = torch.cumsum(pad_masks.to(torch.int32), dim=1) - 1
 
         # Prepare attention masks
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
@@ -384,11 +391,11 @@ class PI0Pytorch(nn.Module):
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_position_ids = torch.cumsum(prefix_pad_masks.to(torch.int32), dim=1) - 1
 
         # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = self._attn_impl  # noqa: SLF001
 
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -439,12 +446,12 @@ class PI0Pytorch(nn.Module):
 
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        prefix_offsets = torch.sum(prefix_pad_masks.to(torch.int32), dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks.to(torch.int32), dim=1) - 1
 
         # Prepare attention masks
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = self._attn_impl  # noqa: SLF001
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,

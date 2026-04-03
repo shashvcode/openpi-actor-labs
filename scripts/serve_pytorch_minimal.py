@@ -27,26 +27,44 @@ from openpi_client.msgpack_numpy import Packer as MsgPacker, unpackb as msg_unpa
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-CHECKPOINT_DIR = "/workspace/openpi/checkpoints/runC_pytorch"
-NORM_STATS_PATH = f"{CHECKPOINT_DIR}/assets/verm11/runA/norm_stats.json"
 TOKENIZER_MODEL = "/root/.cache/openpi/big_vision/paligemma_tokenizer.model"
 
-ACTION_DIM = 6
 ACTION_HORIZON = 11
 NUM_STEPS = 8
 IMAGE_SIZE = 224
 MAX_TOKEN_LEN = 200
 
+ROBOT_CONFIGS = {
+    "pi05_excavator_v2": {
+        "action_dim": 4,
+        "checkpoint_dir": "/workspace/openpi/checkpoints/excavator_v1_pytorch",
+        "norm_stats": "/workspace/openpi/checkpoints/excavator_v1_pytorch/norm_stats.json",
+        "obs_image_keys": [
+            ("observation/image_cab", "base_0_rgb"),
+            ("observation/image_side", "left_wrist_0_rgb"),
+        ],
+    },
+    "pi05_so100": {
+        "action_dim": 6,
+        "checkpoint_dir": "/workspace/openpi/checkpoints/runD_qat_pytorch",
+        "norm_stats": "/workspace/openpi/checkpoints/runD_qat_pytorch/assets/verm11/runA/norm_stats.json",
+        "obs_image_keys": [
+            ("observation/image_scene", "base_0_rgb"),
+            ("observation/image_wrist", "left_wrist_0_rgb"),
+        ],
+    },
+}
+
 
 @dataclasses.dataclass
 class ModelConfig:
     pi05: bool = True
-    action_dim: int = ACTION_DIM
+    action_dim: int = 6
     action_horizon: int = ACTION_HORIZON
     paligemma_variant: str = "gemma_2b_lora"
     action_expert_variant: str = "gemma_300m_lora"
     dtype: str = "bfloat16"
-    state_dim: int = ACTION_DIM
+    state_dim: int = 6
     max_token_len: int = MAX_TOKEN_LEN
     discrete_state_input: bool = True
 
@@ -73,7 +91,7 @@ class QuantileNormalizer:
         return (actions + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
 
 
-def load_model(device):
+def load_model(device, action_dim, checkpoint_dir):
     import safetensors.torch
     from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
     import openpi.models_pytorch.pi0_pytorch as _pi0
@@ -85,8 +103,8 @@ def load_model(device):
         return _orig(target_dtype, device_type)
     _pi0.get_safe_dtype = _patched
 
-    config = ModelConfig()
-    log.info("Creating PI0Pytorch model...")
+    config = ModelConfig(action_dim=action_dim, state_dim=action_dim)
+    log.info("Creating PI0Pytorch model (action_dim=%d)...", action_dim)
     orig_compile = torch.compile
     torch.compile = lambda fn, **kw: fn
     try:
@@ -94,9 +112,10 @@ def load_model(device):
     finally:
         torch.compile = orig_compile
 
-    log.info("Loading weights...")
+    safetensors_path = f"{checkpoint_dir}/model.safetensors"
+    log.info("Loading weights from %s...", safetensors_path)
     t0 = time.time()
-    safetensors.torch.load_model(model, f"{CHECKPOINT_DIR}/model.safetensors", device=str(device))
+    safetensors.torch.load_model(model, safetensors_path, device=str(device))
     log.info("Weights loaded in %.1fs", time.time() - t0)
 
     model.eval()
@@ -145,10 +164,16 @@ def preprocess_image(img_uint8):
 
 
 class PyTorchPolicy:
-    def __init__(self, model, device, normalizer, tokenizer_path):
+    def __init__(self, model, device, normalizer, tokenizer_path, action_dim,
+                 obs_image_keys=None):
         self.model = model
         self.device = device
         self.normalizer = normalizer
+        self.action_dim = action_dim
+        self.obs_image_keys = obs_image_keys or [
+            ("observation/image_scene", "base_0_rgb"),
+            ("observation/image_wrist", "left_wrist_0_rgb"),
+        ]
 
         import sentencepiece
         self.sp = sentencepiece.SentencePieceProcessor(model_file=tokenizer_path)
@@ -174,17 +199,13 @@ class PyTorchPolicy:
         start = time.monotonic()
         from openpi.models import model as _model
 
-        raw_state = np.asarray(_ensure_array(obs.get("observation/state"), fallback_shape=(ACTION_DIM,)), dtype=np.float32)
+        raw_state = np.asarray(_ensure_array(obs.get("observation/state"), fallback_shape=(self.action_dim,)), dtype=np.float32)
         norm_state = self.normalizer.normalize_state(raw_state)
 
         tokens, token_mask = self.tokenize(obs.get("prompt", "pick up the cube"), norm_state)
 
-        img_keys = [
-            ("observation/image_scene", "base_0_rgb"),
-            ("observation/image_wrist", "left_wrist_0_rgb"),
-        ]
         images = {}
-        for obs_key, model_key in img_keys:
+        for obs_key, model_key in self.obs_image_keys:
             if obs_key in obs:
                 img = np.asarray(_ensure_array(obs[obs_key]))
                 if np.issubdtype(img.dtype, np.floating):
@@ -220,7 +241,7 @@ class PyTorchPolicy:
         with torch.no_grad():
             raw_actions = self.model.sample_actions(self.device, observation, num_steps=NUM_STEPS)
 
-        actions_np = raw_actions.cpu().numpy()[0, :, :ACTION_DIM]
+        actions_np = raw_actions.cpu().numpy()[0, :, :self.action_dim]
         actions_unnorm = self.normalizer.unnormalize_actions(actions_np)
 
         infer_ms = (time.monotonic() - start) * 1000
@@ -232,7 +253,7 @@ class PyTorchPolicy:
 
     @property
     def metadata(self):
-        return {"action_dim": ACTION_DIM, "action_horizon": ACTION_HORIZON, "model": "pi0.5-pytorch"}
+        return {"action_dim": self.action_dim, "action_horizon": ACTION_HORIZON, "model": "pi0.5-pytorch"}
 
 
 async def handler(websocket, policy):
@@ -277,23 +298,34 @@ async def main_async(policy, port):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config-name", default="pi05_excavator_v2",
+                        choices=list(ROBOT_CONFIGS.keys()),
+                        help="Robot config to use (sets ACTION_DIM and default paths)")
     parser.add_argument("--port", type=int, default=8001)
     args = parser.parse_args()
+
+    robot_cfg = ROBOT_CONFIGS[args.config_name]
+    action_dim = robot_cfg["action_dim"]
+    checkpoint_dir = robot_cfg["checkpoint_dir"]
+    norm_stats_path = robot_cfg["norm_stats"]
+    obs_image_keys = robot_cfg["obs_image_keys"]
+    log.info("Robot config: %s  ACTION_DIM=%d", args.config_name, action_dim)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Using device: %s", device)
 
-    model = load_model(device)
-    normalizer = QuantileNormalizer(NORM_STATS_PATH)
-    policy = PyTorchPolicy(model, device, normalizer, TOKENIZER_MODEL)
+    model = load_model(device, action_dim=action_dim, checkpoint_dir=checkpoint_dir)
+    normalizer = QuantileNormalizer(norm_stats_path)
+    policy = PyTorchPolicy(model, device, normalizer, TOKENIZER_MODEL,
+                           action_dim=action_dim, obs_image_keys=obs_image_keys)
 
     log.info("Warming up...")
     dummy_obs = {
-        "observation/state": np.zeros(ACTION_DIM, dtype=np.float32),
-        "observation/image_scene": np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8),
-        "observation/image_wrist": np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8),
+        "observation/state": np.zeros(action_dim, dtype=np.float32),
         "prompt": "pick up the cube",
     }
+    for obs_key, _ in obs_image_keys:
+        dummy_obs[obs_key] = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
     result = policy.infer(dummy_obs)
     log.info("Warmup done. Actions shape: %s, latency: %.1fms",
              result["actions"].shape, result["policy_timing"]["infer_ms"])

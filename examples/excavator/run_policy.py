@@ -72,6 +72,25 @@ import wave
 import cv2
 import numpy as np
 
+STRATEGIST_AVAILABLE = False
+REMOTE_ESTOP_AVAILABLE = False
+OVERRIDE_AVAILABLE = False
+try:
+    from strategist.strategy_buffer import StrategyReader, strategy_to_prompt
+    STRATEGIST_AVAILABLE = True
+except ImportError:
+    pass
+try:
+    from strategist.override_buffer import OverrideReader
+    OVERRIDE_AVAILABLE = True
+except ImportError:
+    pass
+try:
+    from strategist.remote_estop_buffer import RemoteEstopReader
+    REMOTE_ESTOP_AVAILABLE = True
+except ImportError:
+    pass
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -105,10 +124,10 @@ PI_RECEIVER_CMD = (
     " --center-ry 85"
     " --right-i2c-scl 14"
     " --right-i2c-sda 15"
-    " --gain-lx 0.65"
-    " --gain-ly 0.75"
-    " --gain-rx 0.65"
-    " --gain-ry 0.85"
+    " --gain-lx 1.4"
+    " --gain-ly 1.4"
+    " --gain-rx 1.4"
+    " --gain-ry 1.4"
     " --smoothing-alpha 0.22"
     " --max-deg-per-sec 180"
     " --min-angle-step 0.3"
@@ -348,11 +367,14 @@ class KeyboardController:
         return self._quit
 
     def start(self):
-        self._old_settings = termios.tcgetattr(sys.stdin)
-        tty.setcbreak(sys.stdin.fileno())
-        self._thread.start()
-        voice_str = "  T=Talk" if self._speech else ""
-        logger.info("Keyboard controls:  SPACE=E-STOP  R=Resume%s  Q=Quit", voice_str)
+        if sys.stdin.isatty():
+            self._old_settings = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+            self._thread.start()
+            voice_str = "  T=Talk" if self._speech else ""
+            logger.info("Keyboard controls:  SPACE=E-STOP  R=Resume%s  Q=Quit", voice_str)
+        else:
+            logger.info("No TTY — keyboard controls disabled (e-stop/resume/quit). Use Operator UI or SIGINT to stop.")
 
     def stop(self):
         if self._old_settings is not None:
@@ -499,6 +521,19 @@ def run(args):
     openai_key = args.openai_api_key or os.environ.get("OPENAI_API_KEY")
     kb = KeyboardController(servo, initial_prompt=args.prompt, openai_api_key=openai_key)
 
+    # VLM strategist (optional — shared memory from run_strategist.py)
+    strategy_reader = None
+    override_reader = None
+    if args.strategist:
+        if not STRATEGIST_AVAILABLE:
+            sys.exit("--strategist requires the 'strategist' package. "
+                     "Add actor-labs-box2 to PYTHONPATH or install it.")
+        strategy_reader = StrategyReader(args.shm_name)
+        if OVERRIDE_AVAILABLE:
+            override_reader = OverrideReader()
+        logger.info("Strategist enabled: reading shared memory '%s'%s", args.shm_name,
+                   " | override enabled" if override_reader else "")
+
     host_uri = args.host
     port = args.port if not host_uri.startswith("ws") else None
     logger.info("Connecting to policy server at %s:%s ...", host_uri, port)
@@ -516,14 +551,35 @@ def run(args):
     target_dt = 1.0 / args.control_hz
 
     shutdown = False
+    signal_estop_action = [None]  # None | "estop" | "resume", mutable for signal handler
 
     def on_signal(_sig, _frame):
         nonlocal shutdown
         shutdown = True
 
+    def on_sigusr1(_sig, _frame):
+        signal_estop_action[0] = "estop"
+
+    def on_sigusr2(_sig, _frame):
+        signal_estop_action[0] = "resume"
+
     signal.signal(signal.SIGINT, on_signal)
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, on_sigusr1)
+    if hasattr(signal, "SIGUSR2"):
+        signal.signal(signal.SIGUSR2, on_sigusr2)
 
     kb.start()
+
+    remote_estop_reader = None
+    if REMOTE_ESTOP_AVAILABLE:
+        try:
+            remote_estop_reader = RemoteEstopReader()
+            remote_estop_reader._ensure_open(create=True)
+            logger.info("Remote e-stop enabled: Operator UI or kill -USR1 <pid> = E-STOP, kill -USR2 <pid> = Resume")
+        except Exception as e:
+            logger.warning("Remote e-stop unavailable: %s", e)
+            remote_estop_reader = None
 
     logger.info(
         "Control loop: %d Hz action execution, %d Hz UDP to Pi.",
@@ -536,10 +592,28 @@ def run(args):
                 logger.info("Reached max steps (%d). Stopping.", args.max_steps)
                 break
 
+            # Apply signal-based remote e-stop/resume
+            if remote_estop_reader and signal_estop_action[0] == "estop":
+                remote_estop_reader.write_estop(True)
+                signal_estop_action[0] = None
+                logger.warning(">>> E-STOP (SIGUSR1) — servos zeroed. Resume via Operator UI or kill -USR2 %d", os.getpid())
+            if remote_estop_reader and signal_estop_action[0] == "resume":
+                remote_estop_reader.write_estop(False)
+                signal_estop_action[0] = None
+                logger.info(">>> RESUMED (SIGUSR2)")
+
+            remote_estop = remote_estop_reader.read() if remote_estop_reader else None
+            effective_estop = kb.estopped or (remote_estop is True)
+
             # While e-stopped, keep the loop alive but don't send any actions
-            if kb.estopped:
+            if effective_estop:
+                if servo:
+                    servo.set_estop()
                 time.sleep(0.05)
                 continue
+
+            if servo:
+                servo.clear_estop()
 
             cab_frame = cab_cam.grab(MODEL_IMG_SIZE)
             side_frame = side_cam.grab(MODEL_IMG_SIZE)
@@ -548,7 +622,36 @@ def run(args):
                 time.sleep(0.01)
                 continue
 
+            # Determine prompt: strategist shared memory or manual keyboard/voice
             current_prompt = kb.prompt
+            if strategy_reader is not None:
+                strat_state = strategy_reader.read()
+                if strat_state is not None:
+                    if strat_state.is_stale:
+                        if servo:
+                            servo.set_estop()
+                        logger.warning("Strategist stale (>%.1fs since last update); e-stop",
+                                       strat_state.timestamp)
+                        time.sleep(0.05)
+                        continue
+                    if not strat_state.global_safety_ok:
+                        # Operator override: if active and not expired, proceed anyway
+                        override_active = False
+                        if override_reader is not None:
+                            ov = override_reader.read()
+                            if ov is not None and ov.is_valid:
+                                override_active = True
+                        if not override_active:
+                            if servo:
+                                servo.set_estop()
+                            logger.warning("SAFETY HOLD from strategist: %s",
+                                           strat_state.hazard_description)
+                            time.sleep(0.05)
+                            continue
+                        logger.info("Operator override active — proceeding despite SAFETY_HOLD")
+                    if servo and not effective_estop:
+                        servo.clear_estop()
+                    current_prompt = strategy_to_prompt(strat_state, task_description=kb.prompt)
             obs = {
                 "observation/state": state.copy(),
                 "observation/image_cab": cab_frame,
@@ -562,7 +665,7 @@ def run(args):
             actions = result["actions"]
 
             for action_idx in range(len(actions)):
-                if shutdown or kb.quit_requested or kb.estopped:
+                if shutdown or kb.quit_requested or effective_estop:
                     break
 
                 action = actions[action_idx]
@@ -572,8 +675,8 @@ def run(args):
                 if args.dry_run:
                     if action_idx == 0:
                         logger.info(
-                            "  [dry-run] action[%d]: lx=%+.3f ly=%+.3f rx=%+.3f ry=%+.3f",
-                            action_idx, lx, ly, rx, ry,
+                            "  [dry-run] action[%d/%d]: lx=%+.3f ly=%+.3f rx=%+.3f ry=%+.3f",
+                            action_idx, len(actions), lx, ly, rx, ry,
                         )
                 else:
                     servo.set_axes(lx, ly, rx, ry)
@@ -591,17 +694,24 @@ def run(args):
 
             if step % 10 == 0:
                 pkt = servo.packets_sent if servo else 0
-                estop_str = " [E-STOPPED]" if kb.estopped else ""
+                estop_str = " [E-STOPPED]" if effective_estop else ""
                 logger.info(
-                    "Step %d | infer %.0fms | action[0]: lx=%+.3f ly=%+.3f rx=%+.3f ry=%+.3f | pkts=%d%s",
-                    step, infer_ms, *actions[0][:ACTION_DIM], pkt, estop_str,
+                    "Step %d | infer %.0fms | horizon %d | action[0]: lx=%+.3f ly=%+.3f rx=%+.3f ry=%+.3f | pkts=%d%s",
+                    step, infer_ms, len(actions),
+                    *actions[0][:ACTION_DIM], pkt, estop_str,
                 )
 
     finally:
         logger.info("Shutting down...")
         kb.stop()
+        if remote_estop_reader is not None:
+            remote_estop_reader.close()
         cab_cam.release()
         side_cam.release()
+        if strategy_reader is not None:
+            strategy_reader.close()
+        if override_reader is not None:
+            override_reader.close()
         if servo is not None:
             servo.close()
         if not args.dry_run and not args.no_ssh and args.kill_on_exit:
@@ -647,6 +757,12 @@ def main():
     g.add_argument("--openai-api-key", default=None,
                    help="OpenAI API key for Whisper speech-to-text (or set OPENAI_API_KEY env var). "
                         "Press T during inference to speak a new prompt.")
+
+    g = parser.add_argument_group("Strategist (VLM)")
+    g.add_argument("--strategist", action="store_true",
+                   help="Enable VLM strategist via shared memory (requires run_strategist.py)")
+    g.add_argument("--shm-name", default="excavator_strategy_v1",
+                   help="POSIX shared memory segment name (must match run_strategist.py)")
 
     g = parser.add_argument_group("Control")
     g.add_argument("--control-hz", type=int, default=CONTROL_HZ,

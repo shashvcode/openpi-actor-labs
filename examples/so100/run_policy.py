@@ -312,11 +312,12 @@ def run(args):
             infer_ms = (time.perf_counter() - infer_start) * 1000
             actions = result["actions"]
 
-            for action_idx in range(len(actions)):
+            chunk = actions[:args.chunk_size]
+            for action_idx in range(len(chunk)):
                 if shutdown:
                     break
 
-                action = actions[action_idx]
+                action = chunk[action_idx]
                 action_start = time.perf_counter()
 
                 if args.dry_run:
@@ -340,9 +341,9 @@ def run(args):
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
-            if step % 10 == 0:
-                logger.info("Step %d | infer %.0fms | action[0]: [%s]",
-                            step, infer_ms,
+            if step % 110 == 0:
+                logger.info("Step %d | infer %.0fms | chunk %d | action[0]: [%s]",
+                            step, infer_ms, len(chunk),
                             ", ".join(f"{v:+.3f}" for v in actions[0]))
 
     finally:
@@ -367,6 +368,8 @@ def main():
                         default="Pick up the bottle and place it on the yellow outlined square.")
     parser.add_argument("--speed", type=float, default=SPEED, help="Movement speed multiplier")
     parser.add_argument("--max-steps", type=int, default=None, help="Max steps before stopping")
+    parser.add_argument("--chunk-size", type=int, default=6,
+                        help="Number of actions from each prediction to execute (1=no chunking, 6=recommended)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print predicted actions without sending to servos")
     args = parser.parse_args()

@@ -290,7 +290,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
     llm_mlp_linear = state_dict.pop(f"llm/layers/mlp_{num_expert}/linear{suffix}")
 
     # Check if we have Dense layers (for pi05/adaptive normalization) or scale layers (for regular pi0)
-    if "pi05" in checkpoint_dir:
+    if pi05:
         # Pi05 with adaptive normalization
         llm_input_layernorm_bias = state_dict.pop(f"llm/layers/pre_attention_norm_{num_expert}/Dense_0/bias{suffix}")
         llm_post_attention_layernorm_bias = state_dict.pop(f"llm/layers/pre_ffw_norm_{num_expert}/Dense_0/bias{suffix}")
@@ -345,7 +345,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             i
         ].transpose()
 
-        if "pi05" in checkpoint_dir:
+        if pi05:
             # Pi05 with adaptive normalization - use Dense layer parameters directly
             state_dict[f"paligemma_with_expert.gemma_expert.model.layers.{i}.input_layernorm.dense.bias"] = (
                 llm_input_layernorm_bias[i]
@@ -369,7 +369,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             )
 
     # Handle final norm layer
-    if "pi05" in checkpoint_dir:
+    if pi05:
         # Pi05 with adaptive normalization - use Dense layer parameters directly
         final_norm_bias = state_dict.pop(f"llm/final_norm_{num_expert}/Dense_0/bias{suffix}")
         final_norm_kernel = state_dict.pop(f"llm/final_norm_{num_expert}/Dense_0/kernel{suffix}")
@@ -391,6 +391,81 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             final_state_dict[key] = value
 
     return final_state_dict
+
+
+def merge_lora_weights(flat_params: dict, model_config) -> dict:
+    """Merge LoRA weights into base weights before conversion to PyTorch.
+
+    For each base weight W with LoRA parameters (lora_a, lora_b), computes:
+        W_merged = W + lora_a @ lora_b * scaling_value
+
+    The scaling_value = alpha / rank (or alpha / sqrt(rank) for rslora).
+    """
+    import openpi.models.gemma as _gemma
+    from openpi.models import lora
+
+    merged = dict(flat_params)
+    merged_count = 0
+
+    # Get LoRA configs for both PaliGemma LLM and expert
+    paligemma_gemma_cfg = _gemma.get_config(model_config.paligemma_variant)
+    expert_cfg = _gemma.get_config(model_config.action_expert_variant)
+
+    # Build a mapping from base weight key to (lora_a_key, lora_b_key, scaling_value)
+    lora_merges = []
+
+    # Attention einsum LoRA: q_einsum, kv_einsum, attn_vec_einsum (both LLM and expert)
+    for suffix_idx, cfg in [("", paligemma_gemma_cfg), ("_1", expert_cfg)]:
+        if cfg.lora_configs is None:
+            continue
+        attn_lora = cfg.lora_configs.get("attn")
+        ffn_lora = cfg.lora_configs.get("ffn")
+
+        if attn_lora:
+            scaling = attn_lora.scaling_value
+            for proj in ["q_einsum", "kv_einsum", "attn_vec_einsum"]:
+                base_key = f"llm/layers/attn/{proj}{suffix_idx}/w"
+                lora_a_key = f"llm/layers/attn/{proj}{suffix_idx}/lora_a"
+                lora_b_key = f"llm/layers/attn/{proj}{suffix_idx}/lora_b"
+                if base_key in merged and lora_a_key in merged:
+                    lora_merges.append((base_key, lora_a_key, lora_b_key, scaling))
+
+        if ffn_lora:
+            scaling = ffn_lora.scaling_value
+            # gating_einsum
+            base_key = f"llm/layers/mlp{suffix_idx}/gating_einsum"
+            lora_a_key = f"llm/layers/mlp{suffix_idx}/gating_einsum_lora_a"
+            lora_b_key = f"llm/layers/mlp{suffix_idx}/gating_einsum_lora_b"
+            if base_key in merged and lora_a_key in merged:
+                lora_merges.append((base_key, lora_a_key, lora_b_key, scaling))
+
+            # linear
+            base_key = f"llm/layers/mlp{suffix_idx}/linear"
+            lora_a_key = f"llm/layers/mlp{suffix_idx}/linear_lora_a"
+            lora_b_key = f"llm/layers/mlp{suffix_idx}/linear_lora_b"
+            if base_key in merged and lora_a_key in merged:
+                lora_merges.append((base_key, lora_a_key, lora_b_key, scaling))
+
+    for base_key, lora_a_key, lora_b_key, scaling in lora_merges:
+        w = merged[base_key]
+        a = merged.pop(lora_a_key)
+        b = merged.pop(lora_b_key)
+
+        # lora_a @ lora_b contracts over the rank dimension (last dim of a, second-to-last of b)
+        # a: (..., M, R), b: (..., R, N) → merged: (..., M, N)
+        delta = np.matmul(a, b) * scaling
+        merged[base_key] = w + delta
+        merged_count += 1
+        print(f"  Merged LoRA into {base_key}: W{w.shape} + A{a.shape}@B{b.shape}*{scaling:.1f} = {merged[base_key].shape}")
+
+    # Remove any remaining lora keys that weren't matched
+    remaining_lora = [k for k in merged if "lora" in k.lower()]
+    for k in remaining_lora:
+        print(f"  WARNING: Removing unmatched LoRA key: {k} {merged[k].shape}")
+        del merged[k]
+
+    print(f"Merged {merged_count} LoRA adapters into base weights")
+    return merged
 
 
 def slice_initial_orbax_checkpoint(checkpoint_dir: str, restore_precision: str | None = None):
@@ -436,6 +511,10 @@ def convert_pi0_checkpoint(
 
     # Break down orbax ckpts by restoring via JAX to respect dtype
     initial_params = slice_initial_orbax_checkpoint(checkpoint_dir=checkpoint_dir, restore_precision="float32")
+
+    # Merge LoRA weights into base weights before conversion
+    print("Merging LoRA weights...")
+    initial_params["paligemma_params"] = merge_lora_weights(initial_params["paligemma_params"], model_config)
 
     # Process projection params
     if model_config.pi05:
@@ -516,8 +595,20 @@ def convert_pi0_checkpoint(
     # Combine all parameters (no prefix needed for our model structure)
     all_params = {**paligemma_params, **gemma_params, **projection_params}
 
-    # Load state dict
-    pi0_model.load_state_dict(all_params, strict=False)
+    # Load state dict — use strict=True to catch any missing/extra weights
+    missing, unexpected = pi0_model.load_state_dict(all_params, strict=False)
+    if missing:
+        print(f"WARNING: {len(missing)} missing keys in state dict:")
+        for k in missing[:10]:
+            print(f"  MISSING: {k}")
+        if len(missing) > 10:
+            print(f"  ... and {len(missing) - 10} more")
+    if unexpected:
+        print(f"WARNING: {len(unexpected)} unexpected keys in state dict:")
+        for k in unexpected[:10]:
+            print(f"  UNEXPECTED: {k}")
+        if len(unexpected) > 10:
+            print(f"  ... and {len(unexpected) - 10} more")
 
     if precision == "float32":
         pi0_model = pi0_model.to(torch.float32)

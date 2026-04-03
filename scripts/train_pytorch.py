@@ -306,6 +306,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config,
     tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     safetensors.torch.save_model(_unwrap_model(model), tmp_ckpt_dir / "model.safetensors")
+    save_quant_observers(model, tmp_ckpt_dir / "quant_observers.pt")
     torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
 
     metadata = {
@@ -413,29 +414,21 @@ def apply_qat(model: torch.nn.Module):
     compensate. Uses per-tensor symmetric quantization with learned scales.
     Only quantizes frozen (base) weight linear layers; LoRA and other
     trainable params stay in full precision.
+
+    Uses manual FakeQuantize insertion (registered as submodules) so that
+    the learned scales/zero-points are saved in checkpoints.
     """
-    from torch.ao.quantization import QConfigMapping, get_default_qat_qconfig
-    from torch.ao.quantization.quantize_fx import prepare_qat_fx
-
-    try:
-        qconfig = get_default_qat_qconfig("x86")
-        qconfig_mapping = QConfigMapping().set_global(qconfig)
-
-        for name, module in model.named_modules():
-            if isinstance(module, torch.nn.Linear) and not any(
-                p.requires_grad for p in module.parameters()
-            ):
-                module.qconfig = qconfig
-
-        logging.info("Applied QAT fake quantization to frozen linear layers")
-    except Exception as e:
-        logging.warning(f"QAT setup failed ({e}), falling back to manual fake quant")
-        _apply_manual_fake_quant(model)
+    _apply_manual_fake_quant(model)
 
 
 def _apply_manual_fake_quant(model: torch.nn.Module):
-    """Fallback: wrap frozen Linear layers with fake quantization observers."""
-    from torch.ao.quantization import FakeQuantize, default_weight_fake_quant
+    """Wrap frozen Linear layers with fake quantization observers.
+
+    Registers each FakeQuantize as a submodule (weight_fake_quant) so its
+    learned scale/zero_point are included in the model hierarchy and can
+    be saved/loaded via save_quant_observers / load_quant_observers.
+    """
+    from torch.ao.quantization import default_weight_fake_quant
 
     count = 0
     for name, module in model.named_modules():
@@ -443,17 +436,36 @@ def _apply_manual_fake_quant(model: torch.nn.Module):
             all_frozen = all(not p.requires_grad for p in module.parameters())
             if all_frozen:
                 fq = default_weight_fake_quant()
+                module.add_module("weight_fake_quant", fq)
 
-                def make_fq_forward(mod, fq_node, orig_forward):
+                def make_fq_forward(mod, orig_forward):
                     def fq_forward(x):
-                        mod.weight.data = fq_node(mod.weight.data)
+                        mod.weight.data = mod.weight_fake_quant(mod.weight.data)
                         return orig_forward(x)
                     return fq_forward
 
-                module.forward = make_fq_forward(module, fq, module.forward)
+                module.forward = make_fq_forward(module, module.forward)
                 count += 1
 
     logging.info(f"Applied manual fake quantization to {count} frozen Linear layers")
+
+
+def save_quant_observers(model: torch.nn.Module, path):
+    """Save all FakeQuantize observer states to a separate file.
+
+    Call after training to persist the learned quantization scales/zero-points.
+    These are loaded at ONNX export time so TRT can use the trained INT8 scales.
+    """
+    quant_state = {}
+    raw_model = _unwrap_model(model)
+    for name, mod in raw_model.named_modules():
+        if hasattr(mod, "weight_fake_quant"):
+            quant_state[name] = mod.weight_fake_quant.state_dict()
+    if quant_state:
+        torch.save(quant_state, path)
+        logging.info(f"Saved QAT observer states for {len(quant_state)} layers -> {path}")
+    else:
+        logging.warning("No QAT observers found to save")
 
 
 # ─── Training Loop ────────────────────────────────────────────────────────────

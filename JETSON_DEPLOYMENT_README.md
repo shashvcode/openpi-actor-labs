@@ -6,7 +6,7 @@ End-to-end pipeline for deploying Physical Intelligence's pi-0.5 model on NVIDIA
 
 **Target hardware**: NVIDIA Jetson AGX Thor Developer Kit (Blackwell GPU, sm_110, 128 GB unified memory)
 
-**Use case**: Real-time robot arm control (SO-100), with future path to semi-autonomous excavator.
+**Use cases**: Real-time robot arm control (SO-100, 6-DOF) and semi-autonomous excavator (4-axis joystick).
 
 ---
 
@@ -17,20 +17,24 @@ All results with shared device buffers enabled (the default).
 | Configuration | Prefix | 8x Denoise | E2E Latency | Speedup | Accuracy (MSE vs FP32) | Control Freq |
 |--------------|--------|------------|-------------|---------|------------------------|-------------|
 | PyTorch eager (baseline) | - | - | 440ms | 1.0x | Reference | 2.3 Hz |
-| TRT FP32 | 154.8ms | 106.8ms | 263ms | 1.67x | Reference | 3.8 Hz |
-| TRT FP16 | 81.6ms | 75.9ms | 161ms | 2.73x | 0.024 | 6.2 Hz |
-| TRT BF16 | 78.6ms | 75.1ms | 158ms | 2.79x | 0.017 | 6.3 Hz |
-| **TRT INT8** | **56.1ms** | **50.8ms** | **108ms** | **4.08x** | **0.082** | **9.3 Hz** |
+| TRT FP32 (runC) | 154.8ms | 106.8ms | 263ms | 1.67x | Reference | 3.8 Hz |
+| TRT FP16 (runC) | 81.6ms | 75.9ms | 161ms | 2.73x | 0.024 | 6.2 Hz |
+| TRT BF16 (runC) | 78.6ms | 75.1ms | 158ms | 2.79x | 0.017 | 6.3 Hz |
+| TRT INT8 PTQ (runC) | 56.1ms | 50.8ms | 108ms | 4.08x | 0.082 | 9.3 Hz |
+| **TRT INT8 QAT (runD_qat)** | **57.5ms** | **~53ms** | **131ms** | **3.36x** | **QAT-trained** | **7.6 Hz** |
 
-**INT8 accuracy note**: MSE 0.082 is from post-training quantization with synthetic calibration data. This can be improved significantly through (a) calibration with real robot observations, (b) QAT during LoRA fine-tuning (expected MSE < 0.005), or (c) FP8 quantization. For initial physical testing, BF16 (158ms, MSE 0.017) is the safe choice; INT8 should be validated on the real robot.
+**Active configuration**: `runD_qat` model with INT8 TRT engines (QAT-trained, native PyTorch).
 
 **Recommended configurations**:
-- **FP32**: 263ms, 3.8 Hz — numerically faithful to PyTorch reference. Use for pipeline validation.
-- **INT8 (with QAT)**: 108ms, 9.3 Hz — target for production after QAT training.
+- **INT8 QAT (runD_qat)**: 131ms, 7.6 Hz — QAT-trained model, quantization-friendly weights. **Current production config.**
+- **FP32**: Use for pipeline validation and debugging only.
 
-**⚠ BF16/FP16 are NOT recommended**: Live arm testing revealed systematic biases in BF16 (sign flip on wrist_flex dimension, +1.117 diff). FP16 was better but still showed drift. Use FP32 to validate, then train a QAT model for INT8.
+**⚠ BF16/FP16 are NOT recommended**: Live arm testing revealed systematic biases in BF16 (sign flip on wrist_flex dimension, +1.117 diff).
 
-**⚠ Current model (runC) has issues**: The existing `model.safetensors` was converted from JAX using `convert_jax_model_to_pytorch.py`. Live arm tests with both the TRT server AND direct PyTorch inference produced incorrect behavior (arm reaching up/back). The JAX model on RunPod works correctly with the same arm/cameras. **Root cause**: likely the JAX→PyTorch weight conversion. **Fix**: train natively in PyTorch (see [Cloud Training Guide](#cloud-training-native-pytorch)).
+**Model history**:
+- `runC`: JAX→PyTorch conversion. Arm behavior "incredibly wrong" due to weight conversion issues. DEPRECATED.
+- `runD`: Native PyTorch-trained (H100). Arm behavior "kinda reasonable" — confirmed conversion fix.
+- `runD_qat`: Native PyTorch-trained with QAT (H100). Slightly better than runD. **Current model.**
 
 ---
 
@@ -62,16 +66,18 @@ The KV cache (~34 MB) is kept on GPU between the prefix and denoise engines. The
 Observation (images, prompt, state)
     │
     ▼
-[Preprocessing - NumPy] ─── 0.7ms
+[Preprocessing - NumPy] ─── ~8ms (resize, tokenize, normalize)
     │
     ▼
-[Prefix Encoder - TRT] ─── 84ms
+[Prefix Encoder - TRT INT8] ─── ~58ms
     │  outputs KV cache to shared GPU buffers
     ▼
-[Denoise Loop x8 - TRT] ─── 79ms total
+[Denoise Loop x8 - TRT INT8] ─── ~66ms total (~8ms/step)
     │  each step: H2D(x_t, timestep) → execute → D2H(velocity) → Euler step
     ▼
-Action trajectory (11 steps x 6 dims)
+[Unnormalize actions] ─── <1ms
+    ▼
+Action trajectory (11 steps x 6 dims) ─── total ~131ms
 ```
 
 ---
@@ -115,7 +121,8 @@ Action trajectory (11 steps x 6 dims)
 | `onnx_export/*_fp32.engine` | FP32 TensorRT engines |
 | `onnx_export/*_bf16.engine` | BF16 TensorRT engines |
 | `onnx_export/*_fp16.engine` | FP16 TensorRT engines |
-| `onnx_export/*_int8.engine` | INT8 TensorRT engines (building) |
+| `onnx_export/*_int8.engine` | INT8 TensorRT engines (PTQ, runC — deprecated) |
+| `onnx_export/*_int8_qat.engine` | INT8 TensorRT engines (QAT, runD_qat — **current**) |
 | `calibration_data/prefix/` | Prefix calibration data (200 samples, ~345 MB) |
 | `calibration_data/denoise/` | Denoise calibration data (800 samples, ~27 GB) |
 
@@ -150,52 +157,71 @@ TensorRT 10.13.3 is used from the host for engine compilation (the container's T
 
 ## How to Use
 
-### 1. Export ONNX (inside Docker container)
+### Quick Start (INT8 QAT — recommended)
+
+The INT8 QAT engines from `runD_qat` are pre-built. Just run:
 
 ```bash
+cd /home/Actor/openpi-actor-labs
+python3 scripts/trt_policy_server.py --precision int8_qat --port 8000
+```
+
+Then on the robot client:
+```bash
+python3 examples/so100/run_policy.py --host <jetson-ip>
+```
+
+### Full Pipeline (re-export from a new checkpoint)
+
+#### 1. Export ONNX (inside Docker container)
+
+```bash
+sudo docker exec -it trt_pipeline bash
 cd /workspace/openpi
 python scripts/export_pytorch_onnx.py \
-  --checkpoint checkpoints/pi05_runC/params \
-  --config pi05_so100_lora_v3 \
-  --output-dir onnx_export
+  --checkpoint /workspace/openpi/checkpoints/runD_qat_pytorch \
+  --dtype float32
 ```
 
-### 2. Compile TRT Engines (on host)
+#### 2. Compile TRT Engines (on host)
 
-**FP32/BF16/FP16** (using trtexec):
 ```bash
-# FP32
-trtexec --onnx=onnx_export/prefix_encoder.onnx \
-  --saveEngine=onnx_export/prefix_encoder_fp32.engine
+cd /home/Actor/openpi-actor-labs/onnx_export
 
-# BF16
-trtexec --onnx=onnx_export/prefix_encoder.onnx \
-  --bf16 --saveEngine=onnx_export/prefix_encoder_bf16.engine
+# INT8 + FP16 fallback (recommended for QAT models)
+/usr/src/tensorrt/bin/trtexec \
+  --onnx=prefix_encoder.onnx \
+  --saveEngine=prefix_encoder_int8_qat.engine \
+  --int8 --fp16 \
+  --memPoolSize=workspace:8192MiB
+
+/usr/src/tensorrt/bin/trtexec \
+  --onnx=denoise_step.onnx \
+  --saveEngine=denoise_step_int8_qat.engine \
+  --int8 --fp16 \
+  --memPoolSize=workspace:8192MiB
 ```
 
-**INT8** (using Python calibration):
-```bash
-# Step 1: Generate calibration data (inside Docker, ~37 min)
-python scripts/generate_calibration_data.py
-
-# Step 2: Build INT8 engines (on host, ~30 min)
-python scripts/build_int8_engines.py --engine denoise
-python scripts/build_int8_engines.py --engine prefix
-```
-
-### 3. Run Benchmark
+#### 3. Serve Policy
 
 ```bash
-python scripts/benchmark_trt.py --precision all
-```
-
-### 4. Serve Policy
-
-```bash
-python scripts/trt_policy_server.py --precision bf16 --port 8000
+python3 scripts/trt_policy_server.py --precision int8_qat --port 8000
 ```
 
 The server accepts WebSocket connections with msgpack-encoded observations and returns action trajectories.
+
+### Other Precision Modes
+
+```bash
+# FP32 (validation only)
+python3 scripts/trt_policy_server.py --precision fp32 --port 8000
+
+# Explicit engine paths
+python3 scripts/trt_policy_server.py \
+  --prefix-engine onnx_export/prefix_encoder_int8_qat.engine \
+  --denoise-engine onnx_export/denoise_step_int8_qat.engine \
+  --port 8000
+```
 
 ---
 
@@ -494,6 +520,158 @@ All configs use LoRA on both Gemma 2B (language) and Gemma 300M (action expert),
 
 ---
 
+## Excavator Deployment (March 11, 2026)
+
+### Goal
+
+Get the excavator model running on the Jetson AGX Thor with behavior identical to cloud inference. The excavator uses `pi05_excavator_v2` config: 4-dim joystick control (left_x, left_y, right_x, right_y), 2 cameras (cab + side), trained on `verm11/excavator_v2`.
+
+### JAX on Jetson Thor — Working
+
+JAX does **not** work with generic PyPI wheels on the Thor GPU. The standard `pip install jax[cuda13]` results in XLA falling back to sm_101 and cuDNN crashes:
+
+```
+Unknown compute capability 11.0. Defaulting to telling LLVM that we're compiling for sm_101
+CUDNN_STATUS_EXECUTION_FAILED
+```
+
+**Fix**: NVIDIA's official JAX container `nvcr.io/nvidia/jax:26.01-py3` (arm64) explicitly supports Jetson Thor. It includes a custom XLA build with sm_110 kernels.
+
+```bash
+sudo docker pull nvcr.io/nvidia/jax:26.01-py3
+
+sudo docker run --rm --runtime nvidia --gpus all --ipc=host \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v /home/Actor/openpi-actor-labs:/workspace/openpi \
+  -w /workspace/openpi \
+  nvcr.io/nvidia/jax:26.01-py3 bash
+```
+
+Inside the container, install project deps (the container has JAX 0.8.1, Flax 0.12.1, orbax 0.11.31 pre-installed):
+
+```bash
+pip install augmax einops sentencepiece equinox 'jaxtyping==0.2.36' ml_collections \
+  tyro dm-tree tqdm-loggable 'beartype==0.19.0' treescope numpydantic safetensors pillow \
+  pytest transformers torch opencv-python \
+  --extra-index-url https://download.pytorch.org/whl/cpu
+
+export PYTHONPATH=/workspace/openpi/src:/workspace/openpi/packages/openpi-client/src
+```
+
+**JAX GPU performance on Thor** (excavator model, `pi05_excavator_v2`):
+
+| Operation | Compile+Execute | Warm |
+|-----------|----------------|------|
+| Single-step velocity | 13.6s | **4.0s** |
+| sample_actions (8 steps) | 10.6s | **6.9s** |
+| Checkpoint load (12.7 GiB) | 205s | — |
+
+Reference outputs saved to `jax_reference_gpu.npz` via `scripts/jax_reference_excavator.py`.
+
+**Note**: The container's orbax 0.11.31 wraps checkpoint leaves in `{'value': array}` dicts. The reference script includes an `_unwrap_value()` helper to flatten these before loading into the model.
+
+### JAX → PyTorch Conversion — LoRA Bug Found and Fixed
+
+**Root cause of SO-100 arm "incredibly wrong" behavior (runC) identified**: The conversion script `examples/convert_jax_model_to_pytorch.py` was **silently dropping all LoRA fine-tuning weights**. The JAX checkpoint has 20 LoRA parameter sets (attention + MLP, for both PaliGemma LLM and the 300M action expert) that encode the entire task-specific adaptation. The conversion only extracted base weights `w` and ignored `lora_a`/`lora_b`. Since `load_state_dict(strict=False)` was used, this was completely silent.
+
+**Impact**: The "converted" PyTorch model was the base pre-trained model, not the fine-tuned one. This explains why runC produced wrong behavior — it was never actually running the fine-tuned model.
+
+**Fix**: Added `merge_lora_weights()` function to the conversion script. For each base weight `W` with LoRA parameters, the merge computes:
+
+```
+W_merged = W + lora_a @ lora_b * (alpha / rank)
+```
+
+For the excavator config, both PaliGemma (rank=16, alpha=16) and the expert (rank=32, alpha=32) have `scaling_value = 1.0`, so the merge is simply `W + lora_a @ lora_b`.
+
+Also added verbose logging of missing/unexpected keys in `load_state_dict` to prevent future silent failures.
+
+**Comparison results** (JAX GPU reference vs LoRA-merged PyTorch):
+
+| Metric | Before Fix (no LoRA) | After Fix (merged) |
+|--------|---------------------|-------------------|
+| v_t MSE | 4.66e-01 | **1.34e-02** (35x better) |
+| Trajectory MSE (8-step) | 4.59e-01 | **4.12e-03** (111x better, **PASS** < 1e-02) |
+| Loss (JAX / PT) | 0.143 / 0.916 | 0.143 / 0.175 |
+
+Per-dimension actions now track closely (joystick axes):
+
+| Dim | JAX | PyTorch (before) | PyTorch (after) |
+|-----|-----|-------------------|-----------------|
+| left_x | 0.012 | -0.211 | -0.050 |
+| left_y | 0.091 | 0.081 | 0.089 |
+| right_x | 0.208 | 0.528 | 0.166 |
+| right_y | -0.016 | -0.417 | -0.080 |
+
+Remaining v_t divergence (~1e-02) is from framework-level numerical differences (JAX/XLA vs PyTorch, different attention implementations, float accumulation order). The trajectory MSE is within threshold and should be imperceptible on the physical excavator.
+
+### Scripts Added
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/jax_reference_excavator.py` | Generate JAX gold-standard outputs inside NVIDIA container, saves to npz |
+| `scripts/compare_jax_vs_pytorch_excavator.py` | Load JAX reference npz, run PyTorch, compare at 5 levels |
+
+### Artifacts
+
+| Path | Contents |
+|------|----------|
+| `checkpoints/excavator_v1_jax/` | JAX checkpoint from HuggingFace `verm11/excavator_v1` (8.9 GB, Orbax format) |
+| `checkpoints/excavator_v1_pytorch/` | LoRA-merged PyTorch checkpoint (14 GB safetensors, float32) |
+| `jax_reference_gpu.npz` | JAX reference outputs (v_t, sampled_actions, inputs) from Thor GPU |
+
+### Excavator TRT Precision Validation (2026-03-11, updated)
+
+Comprehensive numerical comparison of all TRT precision configurations against PyTorch FP32 reference. Validated with both synthetic and real excavator camera images. Script: `scripts/validate_trt_vs_pytorch.py`.
+
+**Round 1 (trtexec default builds):** TRT's default `--fp16`/`--bf16` flags gave unacceptable degradation because TRT aggressively converts ALL operations to the target precision — including softmax, RMSNorm, and other accumulation-sensitive ops that need FP32.
+
+| Config | Total (ms) | KV Keys Cosine | Action Cosine | Verdict |
+|--------|-----------|---------------|--------------|---------|
+| FP32 | ~324 | 0.99999 | 1.00000 | Perfect |
+| BF16 (trtexec) | ~203 | 0.964 | 0.916 | Degraded — TRT converts norm/softmax to BF16 |
+| FP16 (trtexec) | ~195 | 0.206 | broken | BROKEN — layers 1-17 output ALL ZEROS |
+| INT8 (random PTQ) | ~103 | 0.030 | broken | BROKEN (no calibration) |
+
+**Root cause of FP16 collapse**: Per-layer analysis showed layer 0 KV cache was fine (cos=0.9996), but layers 1-17 were literally all zeros. The attention computation in layer 0 produces NaN/Inf when TRT converts softmax and intermediate ops to FP16, which poisons the residual stream for all subsequent layers. PyTorch FP16 is fine (cos=1.0 on all layers) because it keeps softmax/norm in FP32 automatically.
+
+**Root cause of BF16 degradation**: TRT's BF16 kernels for RMSNorm and softmax accumulate errors. Even with mixed-precision approach (keeping norm/softmax in FP32), BF16 matmuls alone introduce ~3.6% per-layer error due to BF16's 7-bit mantissa (vs FP16's 10-bit mantissa). This is an inherent limitation of BF16 in TRT.
+
+**Round 2 (mixed-precision builds with `scripts/build_mixed_precision_engine.py`):** Custom TRT Python API builder that assigns FP16 to matmul/conv layers and FP32 to softmax/norm/reduction layers, matching PyTorch's AMP behavior. Uses `OBEY_PRECISION_CONSTRAINTS` flag.
+
+| Config | Prefix (ms) | Denoise (ms) | Total (ms) | KV Keys Cosine | Action Cosine | Action MSE | Verdict |
+|--------|-------------|-------------|-----------|---------------|--------------|-----------|---------|
+| FP32 | 204 | 120 | 324 | 0.99999 | 1.00000 | 3.87e-09 | Perfect (reference) |
+| **Mixed-FP16** | **109** | **102** | **211** | **0.99985** | **0.99994** | **4.46e-06** | **Near-perfect, 35% faster** |
+| Mixed-FP16 + FP32 denoise | 109 | 131 | 240 | 0.99985 | 1.00000 | 3.87e-09 | Perfect actions |
+| Mixed-BF16 | 105 | 104 | 208 | 0.964 | 0.917 | 4.10e-03 | BF16 matmul precision limit |
+
+**Key findings:**
+
+1. **Mixed-FP16 is the clear winner** — 0.99994 action cosine, MSE 4.46e-06, at 211ms (35% faster than FP32). FP16's 10-bit mantissa provides sufficient precision for matmuls, while FP32 softmax/norm prevents the catastrophic collapse seen with trtexec's `--fp16`.
+2. **Mixed-FP16 + FP32 denoise gives bit-perfect actions** (identical to pure FP32) at 240ms — useful if absolute precision is needed for the denoise loop.
+3. **BF16 in any form is worse than Mixed-FP16** — BF16's 7-bit mantissa causes more matmul error than FP16's 10-bit. The wider dynamic range of BF16 is irrelevant since activations stay within FP16 range.
+4. **Denoise error compounds over 8 steps** — When the denoise step runs in reduced precision, velocity errors accumulate through Euler integration.
+5. **INT8 with random calibration is useless** — needs proper calibration data or QAT. Fresh calibration data is in `calibration_data_fresh/`.
+
+**Pi0.5 `state` input note**: For pi0.5 models, the `state` tensor is NOT used in the denoise step suffix. The state is encoded in the **prefix tokens** (via the tokenizer's discretized state string in the prompt). ONNX tracing correctly optimized away the unused `state` input. The TRT server has been patched to handle this gracefully.
+
+**Deployment recommendation:**
+- **Initial testing**: FP32 (~324ms, perfect accuracy)
+- **Production**: Mixed-FP16 (~211ms, action cosine 0.9999, 35% faster)
+- **Maximum accuracy with speed**: Mixed-FP16 prefix + FP32 denoise (~240ms, perfect actions)
+- **Future**: INT8 with calibrated PTQ or QAT for further latency reduction
+
+### Remaining Steps
+
+1. ~~Update deployment scripts for excavator~~ ✅ Done
+2. ~~ONNX export~~ ✅ Done
+3. ~~TRT engine build + numerical validation~~ ✅ Done (all precisions)
+4. **End-to-end validation** — Run TRT policy server with excavator model, connect excavator client, compare real-world behavior to current cloud inference
+5. **INT8 with proper calibration** — Use calibration data from `calibration_data_fresh/` or QAT training for better INT8 accuracy
+
+---
+
 ## Revision History
 
 | Date | Change |
@@ -517,3 +695,36 @@ All configs use LoRA on both Gemma 2B (language) and Gemma 300M (action expert),
 | 2026-03-05 | Added safety guard against accidental random-weight training |
 | 2026-03-05 | Created CLOUD_TRAINING_GUIDE.md and verify_conversion.py |
 | 2026-03-05 | Pushed all changes to razafork/jetson-integration |
+| 2026-03-05 | Deployed runD (native PyTorch) and runD_qat (QAT) models on Jetson |
+| 2026-03-05 | Live arm test runD: "kinda reasonable", confirms conversion fix |
+| 2026-03-05 | Live arm test runD_qat: "a little better", moving towards target correctly |
+| 2026-03-06 | Fixed closure bug in export_pytorch_onnx.py _apply_qat_for_export |
+| 2026-03-06 | Exported runD_qat to ONNX (FP32, prefix 14MB + 11GB data, denoise 2.9MB + 1.7GB data) |
+| 2026-03-06 | Compiled INT8 QAT TRT engines (prefix 3.2GB/57ms, denoise 413MB/6.6ms) |
+| 2026-03-06 | TRT INT8 QAT server running: 131ms E2E warm latency, 7.6 Hz control freq |
+| 2026-03-11 | Merged origin/main into jetson-integration: gained excavator configs + policies |
+| 2026-03-11 | Downloaded excavator JAX checkpoint from HuggingFace (verm11/excavator_v1, 8.9 GB) |
+| 2026-03-11 | Fixed pi05 detection bug in convert_jax_model_to_pytorch.py (string match → config flag) |
+| 2026-03-11 | Converted excavator JAX checkpoint to PyTorch (initial, without LoRA — broken) |
+| 2026-03-11 | Set up NVIDIA JAX container (nvcr.io/nvidia/jax:26.01-py3) for Thor GPU support |
+| 2026-03-11 | Generated JAX gold-standard reference outputs on Thor GPU (jax_reference_gpu.npz) |
+| 2026-03-11 | **Root cause found**: conversion drops all 20 LoRA parameter sets (silently, via strict=False) |
+| 2026-03-11 | Added merge_lora_weights() to conversion script — merges LoRA into base weights before export |
+| 2026-03-11 | Re-converted excavator model with LoRA merge: trajectory MSE 4.12e-03 (PASS, 111x improvement) |
+| 2026-03-11 | This also explains the SO-100 runC "incredibly wrong" behavior — same bug affected arm model |
+| 2026-03-11 | Updated all 3 deployment scripts for excavator: obs key mapping (image_cab/image_side), --config-name CLI |
+| 2026-03-11 | Fixed critical obs key mismatch: excavator sends image_cab/image_side, servers expected image_scene/image_wrist |
+| 2026-03-11 | Patched model.py restore_params for orbax 0.11.31 StepMetadata API change |
+| 2026-03-11 | JAX serve_policy.py running on Jetson Thor via NVIDIA container, excavator model on port 8000 |
+| 2026-03-11 | Fixed CumSum-on-bool in pi0_pytorch.py and export script (TRT requires int32+ for CumSum) |
+| 2026-03-11 | Exported excavator ONNX: prefix encoder (1.7 MB + 11.3 GB data), denoise step (1.7 GB) |
+| 2026-03-11 | Built FP32 TRT engines for excavator: prefix 150ms, denoise 14ms → ~262ms E2E (8 denoise steps) |
+| 2026-03-11 | Built FP16, BF16, INT8 TRT engines for excavator (all precision levels) |
+| 2026-03-11 | Found and fixed latent bug: trt_policy_server.py tried to h2d `state` tensor but pi0.5 denoise engine doesn't use it (state encoded in prefix tokens) |
+| 2026-03-11 | **Comprehensive numerical validation** of all TRT precision combos vs PyTorch (see table below) |
+| 2026-03-11 | Added mixed-precision support to trt_policy_server.py (`--precision bf16+fp32` syntax) |
+| 2026-03-11 | **Fixed attention mask FP16 overflow**: changed fill value from -2.38e38 (overflows FP16) to -65504 (FP16-safe). This alone didn't fix FP16 collapse — the real issue is TRT converting softmax/norm to FP16 |
+| 2026-03-11 | **Root cause analysis**: PyTorch FP16 produces cosine=1.0 on all 18 layers (FP32 softmax/norm), while TRT's `--fp16` collapses layers 1-17 to zeros. TRT's default precision selection is too aggressive for transformer models |
+| 2026-03-11 | Created `scripts/build_mixed_precision_engine.py`: TRT Python API builder that assigns FP16 to matmul/conv and FP32 to softmax/norm/reduction layers (matches PyTorch AMP behavior) |
+| 2026-03-11 | **Mixed-FP16 engines achieve 0.99994 action cosine at 211ms** (35% faster than FP32, near-identical accuracy). This is the new recommended production configuration |
+| 2026-03-11 | Built mixed-BF16 engines: no improvement over trtexec BF16 (0.964 KV cosine) — confirms the BF16 degradation comes from matmul precision, not norm/softmax |

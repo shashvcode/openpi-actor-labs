@@ -35,11 +35,35 @@ log = logging.getLogger(__name__)
 
 IMAGE_SIZE = 224
 MAX_TOKEN_LEN = 200
-ACTION_DIM = 6
 ACTION_HORIZON = 11
 NUM_DENOISE_STEPS = 8
 
-NORM_STATS_PATH = None  # Set at startup
+ROBOT_CONFIGS = {
+    "pi05_excavator_v2": {
+        "action_dim": 4,
+        "obs_image_keys": [
+            ("observation/image_cab", "base_0_rgb"),
+            ("observation/image_side", "left_wrist_0_rgb"),
+        ],
+        "norm_stats_candidates": [
+            "checkpoints/excavator_v1_pytorch/norm_stats.json",
+        ],
+    },
+    "pi05_so100": {
+        "action_dim": 6,
+        "obs_image_keys": [
+            ("observation/image_scene", "base_0_rgb"),
+            ("observation/image_wrist", "left_wrist_0_rgb"),
+        ],
+        "norm_stats_candidates": [
+            "checkpoints/runD_qat_pytorch/assets/verm11/runA/norm_stats.json",
+            "checkpoints/runD_pytorch/assets/verm11/runA/norm_stats.json",
+            "checkpoints/runC_pytorch/assets/verm11/runA/norm_stats.json",
+        ],
+    },
+}
+
+ACTION_DIM = 4  # default; set by --config-name in main()
 
 
 class QuantileNormalizer:
@@ -177,9 +201,10 @@ def _ensure_array(val, fallback_shape=None):
     return np.asarray(val)
 
 
-def preprocess_observation(obs: dict, tokenizer: Tokenizer, normalizer: QuantileNormalizer | None = None) -> dict:
+def preprocess_observation(obs: dict, tokenizer: Tokenizer, normalizer: QuantileNormalizer | None = None,
+                           action_dim: int = 4, obs_image_keys: list | None = None) -> dict:
     """Convert raw observation dict to TRT-ready numpy arrays."""
-    state = np.asarray(_ensure_array(obs.get("observation/state"), fallback_shape=(ACTION_DIM,)), dtype=np.float32)
+    state = np.asarray(_ensure_array(obs.get("observation/state"), fallback_shape=(action_dim,)), dtype=np.float32)
 
     if normalizer is not None:
         state = normalizer.normalize_state(state)
@@ -187,13 +212,14 @@ def preprocess_observation(obs: dict, tokenizer: Tokenizer, normalizer: Quantile
     prompt = obs.get("prompt", "pick up the cube")
     tokens, token_mask = tokenizer.tokenize(prompt, state=state)
 
-    img_keys = [
-        ("observation/image_scene", "base_0_rgb"),
-        ("observation/image_wrist", "left_wrist_0_rgb"),
-    ]
+    if obs_image_keys is None:
+        obs_image_keys = [
+            ("observation/image_scene", "base_0_rgb"),
+            ("observation/image_wrist", "left_wrist_0_rgb"),
+        ]
 
     images = {}
-    for obs_key, model_key in img_keys:
+    for obs_key, model_key in obs_image_keys:
         if obs_key in obs:
             img = np.asarray(_ensure_array(obs[obs_key]))
             if np.issubdtype(img.dtype, np.floating):
@@ -244,9 +270,16 @@ class TRTEngine:
         for i in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(i)
             shape = list(self.engine.get_tensor_shape(name))
-            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+            trt_dtype = self.engine.get_tensor_dtype(name)
+            try:
+                dtype = trt.nptype(trt_dtype)
+            except TypeError:
+                if trt_dtype == trt.bfloat16:
+                    dtype = np.float32
+                else:
+                    raise
             mode = self.engine.get_tensor_mode(name)
-            self._io_info[name] = {"shape": shape, "dtype": dtype, "is_input": mode == trt.TensorIOMode.INPUT}
+            self._io_info[name] = {"shape": shape, "dtype": dtype, "trt_dtype": trt_dtype, "is_input": mode == trt.TensorIOMode.INPUT}
 
         log.info("  Tensors: %s", {k: (v["shape"], v["dtype"].__name__, "in" if v["is_input"] else "out")
                                     for k, v in self._io_info.items()})
@@ -370,7 +403,10 @@ class TRTPolicy:
     """Pi-0.5 policy using TRT engines with shared device buffers."""
 
     def __init__(self, prefix_engine_path: str, denoise_engine_path: str, tokenizer_path: str,
-                 norm_stats_path: str | None = None):
+                 norm_stats_path: str | None = None, action_dim: int = 4,
+                 obs_image_keys: list | None = None):
+        self.action_dim = action_dim
+        self.obs_image_keys = obs_image_keys
         self.prefix_engine = TRTEngine(prefix_engine_path)
 
         shared = {name: self.prefix_engine.get_device_ptr(name) for name in SHARED_TENSORS}
@@ -382,7 +418,20 @@ class TRTPolicy:
 
     def infer(self, obs: dict) -> dict:
         start = time.monotonic()
-        inputs = preprocess_observation(obs, self.tokenizer, self.normalizer)
+        inputs = preprocess_observation(obs, self.tokenizer, self.normalizer,
+                                        action_dim=self.action_dim, obs_image_keys=self.obs_image_keys)
+
+        if not hasattr(self, '_debug_count'):
+            self._debug_count = 0
+        self._debug_count += 1
+        if self._debug_count <= 3:
+            np.savez(f"/tmp/trt_live_inputs_{self._debug_count}.npz", **inputs)
+            log.info("DEBUG step %d: img0 mean=%.4f std=%.4f, img1 mean=%.4f std=%.4f, state=%s, tokens[:10]=%s",
+                     self._debug_count,
+                     inputs["img0"].mean(), inputs["img0"].std(),
+                     inputs["img1"].mean(), inputs["img1"].std(),
+                     inputs["state"],
+                     inputs["tokens"][0, :10])
 
         self.prefix_engine.infer(
             {
@@ -399,10 +448,12 @@ class TRTPolicy:
         )
 
         de = self.denoise_engine
-        de.h2d("state", inputs["state"])
+        if "state" in de._io_info:
+            de.h2d("state", inputs["state"])
 
         rng = np.random.default_rng()
-        x_t = rng.standard_normal((1, ACTION_HORIZON, ACTION_DIM)).astype(np.float32)
+        engine_action_dim = de._io_info["velocity"]["shape"][-1]
+        x_t = rng.standard_normal((1, ACTION_HORIZON, engine_action_dim)).astype(np.float32)
 
         dt = np.float32(-1.0 / NUM_DENOISE_STEPS)
         t = np.float32(1.0)
@@ -417,7 +468,11 @@ class TRTPolicy:
             t += t_step
 
         infer_ms = (time.monotonic() - start) * 1000
-        actions = x_t[0, :, :ACTION_DIM]
+        actions = x_t[0, :, :self.action_dim]
+
+        if self._debug_count <= 3:
+            log.info("DEBUG step %d: raw_actions[0]=%s, raw_actions[5]=%s",
+                     self._debug_count, actions[0], actions[5])
 
         if self.normalizer is not None:
             actions = self.normalizer.unnormalize_actions(actions)
@@ -431,7 +486,7 @@ class TRTPolicy:
     @property
     def metadata(self) -> dict:
         return {
-            "action_dim": ACTION_DIM,
+            "action_dim": self.action_dim,
             "action_horizon": ACTION_HORIZON,
             "model": "pi0.5-trt",
         }
@@ -502,11 +557,23 @@ class TRTWebSocketServer:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    global ACTION_DIM
+
     parser = argparse.ArgumentParser(description="TRT Policy Server for pi-0.5")
+    parser.add_argument("--config-name", default="pi05_excavator_v2",
+                        choices=list(ROBOT_CONFIGS.keys()),
+                        help="Robot config (sets ACTION_DIM and default norm stats)")
     parser.add_argument("--prefix-engine", help="Path to prefix encoder TRT engine")
     parser.add_argument("--denoise-engine", help="Path to denoise step TRT engine")
-    parser.add_argument("--precision", default="fp32", choices=["fp32", "fp16", "bf16", "int8"],
-                        help="TRT precision mode (selects engine files automatically)")
+    parser.add_argument("--precision", default="fp32",
+                        choices=["fp32", "fp16", "bf16", "int8",
+                                 "mixed_fp16", "mixed_bf16",
+                                 "mixed_fp16+fp32", "mixed_fp16+mixed_fp16",
+                                 "bf16+fp32", "fp32+bf16", "fp32+fp16",
+                                 "int8_qat", "fp16_qat", "fp32_qat"],
+                        help="TRT precision mode (selects engine files automatically). "
+                             "'mixed_fp16' uses FP16 matmuls + FP32 softmax/norm (recommended). "
+                             "Mixed modes like 'bf16+fp32' mean prefix_encoder_bf16 + denoise_step_fp32.")
     parser.add_argument("--engine-dir", default="onnx_export", help="Directory containing TRT engine files")
     parser.add_argument("--tokenizer-path",
                         default=str(pathlib.Path.home() / ".cache/openpi/big_vision/paligemma_tokenizer.model"),
@@ -517,32 +584,46 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     args = parser.parse_args()
 
+    robot_cfg = ROBOT_CONFIGS[args.config_name]
+    ACTION_DIM = robot_cfg["action_dim"]
+    log.info("Robot config: %s  ACTION_DIM=%d", args.config_name, ACTION_DIM)
+
     if args.prefix_engine and args.denoise_engine:
         prefix_path = args.prefix_engine
         denoise_path = args.denoise_engine
     else:
         engine_dir = pathlib.Path(args.engine_dir)
-        prefix_path = str(engine_dir / f"prefix_encoder_{args.precision}.engine")
-        denoise_path = str(engine_dir / f"denoise_step_{args.precision}.engine")
-        log.info("Using %s precision engines from %s", args.precision.upper(), engine_dir)
+        if "+" in args.precision:
+            prefix_prec, denoise_prec = args.precision.split("+")
+        else:
+            prefix_prec = denoise_prec = args.precision
+        prefix_path = str(engine_dir / f"prefix_encoder_{prefix_prec}.engine")
+        denoise_path = str(engine_dir / f"denoise_step_{denoise_prec}.engine")
+        log.info("Using engines: prefix=%s, denoise=%s", prefix_path, denoise_path)
 
     norm_stats_path = args.norm_stats
     if norm_stats_path is None:
-        default_path = pathlib.Path("checkpoints/runC_pytorch/assets/verm11/runA/norm_stats.json")
-        if default_path.exists():
-            norm_stats_path = str(default_path)
-            log.info("Auto-detected norm stats: %s", norm_stats_path)
+        for candidate in robot_cfg["norm_stats_candidates"]:
+            if pathlib.Path(candidate).exists():
+                norm_stats_path = candidate
+                log.info("Auto-detected norm stats: %s", norm_stats_path)
+                break
+        if norm_stats_path is None:
+            log.warning("No norm_stats.json found! Tried: %s", robot_cfg["norm_stats_candidates"])
 
-    policy = TRTPolicy(prefix_path, denoise_path, args.tokenizer_path, norm_stats_path=norm_stats_path)
+    obs_image_keys = robot_cfg["obs_image_keys"]
+    policy = TRTPolicy(prefix_path, denoise_path, args.tokenizer_path,
+                       norm_stats_path=norm_stats_path, action_dim=ACTION_DIM,
+                       obs_image_keys=obs_image_keys)
     server = TRTWebSocketServer(policy, host=args.host, port=args.port)
 
     log.info("Warming up with dummy inference...")
     dummy_obs = {
         "observation/state": np.zeros(ACTION_DIM, dtype=np.float32),
-        "observation/image_scene": np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8),
-        "observation/image_wrist": np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8),
         "prompt": "pick up the cube",
     }
+    for obs_key, _ in obs_image_keys:
+        dummy_obs[obs_key] = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
     result = policy.infer(dummy_obs)
     log.info("Warmup done. Action shape: %s, latency: %.1f ms",
              result["actions"].shape, result["policy_timing"]["infer_ms"])

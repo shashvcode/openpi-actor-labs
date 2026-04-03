@@ -24,11 +24,23 @@ import torch.nn as nn
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-WORKSPACE = pathlib.Path("/workspace/openpi")
-CHECKPOINT_DIR = WORKSPACE / "checkpoints" / "runC_pytorch"
+WORKSPACE = pathlib.Path(os.environ.get("OPENPI_WORKSPACE", "/workspace/openpi"))
+if not WORKSPACE.exists():
+    WORKSPACE = pathlib.Path(__file__).resolve().parent.parent
 OUTPUT_DIR = WORKSPACE / "onnx_export"
 
 sys.path.insert(0, str(WORKSPACE / "src"))
+
+ROBOT_CONFIGS = {
+    "pi05_excavator_v2": {
+        "action_dim": 4,
+        "checkpoint_dir": WORKSPACE / "checkpoints" / "excavator_v1_pytorch",
+    },
+    "pi05_so100": {
+        "action_dim": 6,
+        "checkpoint_dir": WORKSPACE / "checkpoints" / "runC_pytorch",
+    },
+}
 
 
 @dataclasses.dataclass
@@ -62,7 +74,7 @@ class PrefixEncoderWrapper(nn.Module):
         )
 
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_position_ids = torch.cumsum(prefix_pad_masks.to(torch.int32), dim=1) - 1
         prefix_att_2d_masks_4d = self.model._prepare_attention_masks_4d(prefix_att_2d_masks)
 
         self.model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
@@ -120,7 +132,7 @@ def _patch_float64_to_float32():
     log.info("Patched get_safe_dtype: float64 → float32 for ONNX compatibility")
 
 
-def load_model(device="cpu", export_dtype="float32", qat_checkpoint=None):
+def load_model(device="cpu", export_dtype="float32", qat_checkpoint=None, checkpoint_override=None, action_dim=6):
     """Load PI0Pytorch without torch.compile, then load safetensors weights.
 
     If qat_checkpoint is provided, loads the QAT-trained checkpoint and applies
@@ -132,9 +144,9 @@ def load_model(device="cpu", export_dtype="float32", qat_checkpoint=None):
 
     _patch_float64_to_float32()
 
-    config = ModelConfig()
+    config = ModelConfig(action_dim=action_dim)
 
-    log.info("Creating PI0Pytorch model (torch.compile disabled)...")
+    log.info("Creating PI0Pytorch model (action_dim=%d, torch.compile disabled)...", action_dim)
     t0 = time.time()
     original_compile = torch.compile
     torch.compile = lambda fn, **kwargs: fn
@@ -144,7 +156,7 @@ def load_model(device="cpu", export_dtype="float32", qat_checkpoint=None):
         torch.compile = original_compile
     log.info("Model created in %.1fs", time.time() - t0)
 
-    ckpt_dir = pathlib.Path(qat_checkpoint) if qat_checkpoint else CHECKPOINT_DIR
+    ckpt_dir = pathlib.Path(checkpoint_override) if checkpoint_override else None
     safetensors_path = ckpt_dir / "model.safetensors"
     log.info("Loading weights from %s...", safetensors_path)
     t0 = time.time()
@@ -153,7 +165,7 @@ def load_model(device="cpu", export_dtype="float32", qat_checkpoint=None):
 
     if qat_checkpoint:
         log.info("QAT mode: inserting fake quantization nodes for ONNX export...")
-        _apply_qat_for_export(model)
+        _apply_qat_for_export(model, ckpt_dir)
 
     if export_dtype == "float32":
         log.info("Converting model to float32 for ONNX export...")
@@ -161,39 +173,55 @@ def load_model(device="cpu", export_dtype="float32", qat_checkpoint=None):
     elif export_dtype == "float16":
         log.info("Converting model to float16 for ONNX export...")
         model = model.half()
+    elif export_dtype == "bfloat16":
+        log.info("Keeping model in native bfloat16 for ONNX export...")
 
     model.eval()
     model.to(device)
     return model
 
 
-def _apply_qat_for_export(model):
-    """Apply fake quantization to match a QAT-trained model for export.
+def _apply_qat_for_export(model, ckpt_dir):
+    """Restore trained FakeQuantize observers for ONNX export.
 
-    Inserts FakeQuantize observers on all Linear layers so the ONNX graph
-    contains QuantizeLinear/DequantizeLinear ops with the trained scales.
-    TensorRT reads these learned scales and skips PTQ calibration entirely.
+    Loads the learned scales/zero-points from quant_observers.pt (saved during
+    QAT training) and attaches them to matching Linear layers. The ONNX graph
+    will contain QuantizeLinear/DequantizeLinear ops with the correct trained
+    scales so TensorRT can build INT8 engines without PTQ calibration.
+
+    Falls back to fresh (untrained) observers with a warning if the saved
+    state file is missing.
     """
-    try:
-        from torch.ao.quantization import default_weight_fake_quant
+    from torch.ao.quantization import default_weight_fake_quant
 
-        count = 0
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Linear):
-                fq = default_weight_fake_quant()
-                original_forward = module.forward
+    quant_path = pathlib.Path(ckpt_dir) / "quant_observers.pt"
+    if quant_path.exists():
+        quant_state = torch.load(quant_path, weights_only=True)
+        log.info("  Loaded trained QAT observer states from %s (%d layers)", quant_path, len(quant_state))
+    else:
+        quant_state = {}
+        log.warning("  quant_observers.pt not found at %s — using fresh (untrained) observers", quant_path)
 
-                def make_fq_forward(mod, fq_node):
-                    def fq_forward(x):
-                        mod.weight.data = fq_node(mod.weight.data)
-                        return original_forward(x)
-                    return fq_forward
+    count = 0
+    restored = 0
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            fq = default_weight_fake_quant()
+            if name in quant_state:
+                fq.load_state_dict(quant_state[name])
+                restored += 1
+            module.add_module("weight_fake_quant", fq)
 
-                module.forward = make_fq_forward(module, fq)
-                count += 1
-        log.info("  Applied fake quantization to %d Linear layers for ONNX export", count)
-    except ImportError:
-        log.warning("torch.ao.quantization not available, skipping QAT export annotations")
+            def make_fq_forward(mod, orig_forward):
+                def fq_forward(x):
+                    mod.weight.data = mod.weight_fake_quant(mod.weight.data)
+                    return orig_forward(x)
+                return fq_forward
+
+            module.forward = make_fq_forward(module, module.forward)
+            count += 1
+
+    log.info("  Applied fake quantization to %d Linear layers (%d with trained scales)", count, restored)
 
 
 def determine_shapes(model, device="cpu"):
@@ -212,7 +240,7 @@ def determine_shapes(model, device="cpu"):
             images, img_masks, tokens, token_masks
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_position_ids = torch.cumsum(prefix_pad_masks.to(torch.int32), dim=1) - 1
         prefix_att_2d_masks_4d = model._prepare_attention_masks_4d(prefix_att_2d_masks)
         model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
 
@@ -281,8 +309,23 @@ def export_prefix_encoder(model, shapes, output_dir, device="cpu"):
         dynamic_axes=None,
     )
     elapsed = time.time() - t0
+
+    import onnx
+    from onnx.external_data_helper import convert_model_to_external_data
+    log.info("  Saving prefix encoder with external data...")
+    model_proto = onnx.load(str(onnx_path), load_external_data=True)
+    convert_model_to_external_data(
+        model_proto, all_tensors_to_one_file=True,
+        location="prefix_encoder.onnx.data", size_threshold=1024,
+    )
+    onnx.save_model(model_proto, str(onnx_path))
+    del model_proto
+
     size_mb = onnx_path.stat().st_size / 1e6
-    log.info("  Prefix encoder exported in %.1fs → %s (%.1f MB)", elapsed, onnx_path, size_mb)
+    data_path = output_dir / "prefix_encoder.onnx.data"
+    data_mb = data_path.stat().st_size / 1e6 if data_path.exists() else 0
+    log.info("  Prefix encoder exported in %.1fs → %s (%.1f MB proto + %.1f MB data)",
+             elapsed, onnx_path, size_mb, data_mb)
     return onnx_path
 
 
@@ -330,9 +373,11 @@ def verify_onnx(onnx_path):
     import onnx
 
     size_mb = onnx_path.stat().st_size / 1e6
-    log.info("Verifying %s (%.1f MB)...", onnx_path.name, size_mb)
+    data_file = pathlib.Path(str(onnx_path) + ".data")
+    total_mb = size_mb + (data_file.stat().st_size / 1e6 if data_file.exists() else 0)
+    log.info("Verifying %s (%.1f MB proto, %.1f MB total)...", onnx_path.name, size_mb, total_mb)
 
-    if size_mb > 2000:
+    if total_mb > 2000:
         onnx.checker.check_model(str(onnx_path))
         model = onnx.load(str(onnx_path), load_external_data=False)
     else:
@@ -353,18 +398,32 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32",
+    parser.add_argument("--config-name", default="pi05_excavator_v2",
+                        choices=list(ROBOT_CONFIGS.keys()),
+                        help="Robot config to use (sets ACTION_DIM and default checkpoint)")
+    parser.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="bfloat16",
                         help="Export precision (float32 for CPU verification, float16 for TRT)")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to a checkpoint directory (overrides default from config).")
     parser.add_argument("--qat-checkpoint", type=str, default=None,
                         help="Path to a QAT-trained checkpoint directory. "
                              "When provided, ONNX export includes QuantizeLinear/DequantizeLinear ops "
                              "with learned scales so TRT skips PTQ calibration.")
     args = parser.parse_args()
+    if args.checkpoint and args.qat_checkpoint:
+        parser.error("Use --checkpoint or --qat-checkpoint, not both.")
+
+    robot_cfg = ROBOT_CONFIGS[args.config_name]
+    action_dim = robot_cfg["action_dim"]
+    default_ckpt_dir = str(robot_cfg["checkpoint_dir"])
+    log.info("Robot config: %s  ACTION_DIM=%d  default_checkpoint=%s", args.config_name, action_dim, default_ckpt_dir)
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     device = "cpu"
 
-    model = load_model(device, export_dtype=args.dtype, qat_checkpoint=args.qat_checkpoint)
+    ckpt = args.qat_checkpoint or args.checkpoint or default_ckpt_dir
+    model = load_model(device, export_dtype=args.dtype, qat_checkpoint=args.qat_checkpoint,
+                       checkpoint_override=ckpt, action_dim=action_dim)
     shapes = determine_shapes(model, device)
 
     prefix_path = export_prefix_encoder(model, shapes, OUTPUT_DIR, device)

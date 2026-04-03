@@ -2,6 +2,7 @@ from typing import Literal
 
 import pytest
 import torch
+import torch.nn.functional as F  # noqa: N812
 from torch import nn
 from transformers import GemmaForCausalLM
 from transformers import PaliGemmaForConditionalGeneration
@@ -197,15 +198,29 @@ class PaliGemmaWithExpertModel(nn.Module):
                 batch_size = query_states.shape[0]
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
-                # Attention computation
-                att_output, _ = modeling_gemma.eager_attention_forward(
-                    self.paligemma.language_model.layers[layer_idx].self_attn,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask,
-                    scaling,
-                )
+                # Attention computation -- use SDPA when available for fused kernels
+                if getattr(self, '_use_sdpa', False):
+                    num_kv_groups = self.paligemma.language_model.layers[layer_idx].self_attn.num_key_value_groups
+                    k_exp = modeling_gemma.repeat_kv(key_states, num_kv_groups)
+                    v_exp = modeling_gemma.repeat_kv(value_states, num_kv_groups)
+                    sdpa_mask = attention_mask[:, :, :, :k_exp.shape[-2]] if attention_mask is not None else None
+                    if sdpa_mask is not None and sdpa_mask.dtype != query_states.dtype:
+                        sdpa_mask = sdpa_mask.to(query_states.dtype)
+                    att_output = F.scaled_dot_product_attention(
+                        query_states, k_exp, v_exp,
+                        attn_mask=sdpa_mask,
+                        scale=scaling,
+                    )
+                    att_output = att_output.transpose(1, 2).contiguous()
+                else:
+                    att_output, _ = modeling_gemma.eager_attention_forward(
+                        self.paligemma.language_model.layers[layer_idx].self_attn,
+                        query_states,
+                        key_states,
+                        value_states,
+                        attention_mask,
+                        scaling,
+                    )
                 # Get head_dim from the current layer, not from the model
                 head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
                 att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
