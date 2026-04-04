@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 800 350" width="800" height="350">
+  <defs>
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@700&amp;display=swap");
+
+      .ov-circle {
+        transform-origin: 131px 192px;
+        animation: pop 0.8s cubic-bezier(0.175,0.885,0.32,1.275) 0.2s both;
+      }
+      @keyframes pop {
+        0%   { transform: scale(0); opacity: 0; }
+        40%  { opacity: 1; }
+        100% { transform: scale(1); opacity: 1; }
+      }
+
+      .ov-arc {
+        stroke-dasharray: 222;
+        stroke-dashoffset: 222;
+        animation: drawIn 1.2s cubic-bezier(0.4,0,0.2,1) 1.0s forwards;
+      }
+      @keyframes drawIn { to { stroke-dashoffset: 0; } }
+
+      .ov-leg-l {
+        stroke-dasharray: 108;
+        stroke-dashoffset: 108;
+        animation: drawIn 0.45s cubic-bezier(0.4,0,0.2,1) 2.2s forwards;
+      }
+      .ov-leg-c {
+        stroke-dasharray: 110;
+        stroke-dashoffset: 110;
+        animation: drawIn 0.45s cubic-bezier(0.4,0,0.2,1) 2.6s forwards;
+      }
+      .ov-leg-r {
+        stroke-dasharray: 108;
+        stroke-dashoffset: 108;
+        animation: drawIn 0.45s cubic-bezier(0.4,0,0.2,1) 3.0s forwards;
+      }
+
+      .eye-blink {
+        transform-origin: 131px 192px;
+        animation: blinkAnim 8s ease-in-out 4.5s infinite;
+      }
+      @keyframes blinkAnim {
+        0%, 96%, 100% { transform: scaleY(1); }
+        98%           { transform: scaleY(0.05); }
+      }
+
+    </style>
+
+    <clipPath id="textClip">
+      <rect x="253" y="158" width="0" height="90">
+        <animate attributeName="width" from="0" to="490"
+                 begin="4.2s" dur="1.3s" fill="freeze"
+                 calcMode="spline" keySplines="0.25 0.46 0.45 0.94"/>
+      </rect>
+    </clipPath>
+  </defs>
+
+  <rect width="800" height="350" fill="#e8e4dc"/>
+
+  <!-- legs (scaled down ~82%) -->
+  <line class="ov-leg-l" x1="131" y1="192" x2="73" y2="252"
+        stroke="#0a0a0a" stroke-width="20" stroke-linecap="round"/>
+  <line class="ov-leg-c" x1="131" y1="192" x2="131" y2="277"
+        stroke="#0a0a0a" stroke-width="20" stroke-linecap="round"/>
+  <line class="ov-leg-r" x1="131" y1="192" x2="189" y2="252"
+        stroke="#0a0a0a" stroke-width="20" stroke-linecap="round"/>
+
+  <!-- arc (scaled down ~82%) -->
+  <path class="ov-arc"
+        d="M 55 180 A 78 78 0 0 1 208 180"
+        fill="none" stroke="#0a0a0a" stroke-width="20" stroke-linecap="round"/>
+
+  <!-- junction cover -->
+  <circle cx="131" cy="192" r="28" fill="#e8e4dc"/>
+
+  <!-- blue circle / eye -->
+  <circle class="eye-blink" cx="131" cy="192" r="28" fill="#1d4ed8"/>
+
+  <!-- ACTOR LABS (moved left, same size) -->
+  <text x="260" y="212" text-anchor="start"
+        font-family="'Space Grotesk', sans-serif" font-weight="700"
+        font-size="64" fill="#181818" letter-spacing="5"
+        clip-path="url(#textClip)">ACTOR LABS</text>
+
+</svg>
