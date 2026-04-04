@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Minimal PyTorch policy server for direct comparison with TRT server.
+"""Minimal PyTorch policy server for PI0.5 on Jetson Thor.
 
-Loads the PI0.5 model in PyTorch, serves via same WebSocket protocol.
-Run inside Docker: docker exec great_poitras python3 /workspace/openpi/scripts/serve_pytorch_minimal.py
+Loads the PI0.5 model in PyTorch, serves via WebSocket protocol.
+The client (run_policy.py) sends observations and receives actions.
 
-Connects to port 8001 to avoid conflict with TRT server on 8000.
+Usage:
+    # SO-100 encoder model:
+    python scripts/serve_pytorch_minimal.py --config-name pi05_so100_encoder --port 8001
+
+    # SO-100 (runD_qat, legacy):
+    python scripts/serve_pytorch_minimal.py --config-name pi05_so100 --port 8001
 """
 
 import asyncio
@@ -12,6 +17,8 @@ import dataclasses
 import http
 import json
 import logging
+import os
+import pathlib
 import sys
 import time
 
@@ -20,37 +27,57 @@ import torch
 import websockets.asyncio.server as ws_server
 import websockets.frames
 
-sys.path.insert(0, "/workspace/openpi/src")
+_SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPT_DIR.parent
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+sys.path.insert(0, str(_REPO_ROOT / "packages" / "openpi-client" / "src"))
 
 from openpi_client.msgpack_numpy import Packer as MsgPacker, unpackb as msg_unpackb
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-TOKENIZER_MODEL = "/root/.cache/openpi/big_vision/paligemma_tokenizer.model"
+_TOKENIZER_SEARCH_PATHS = [
+    pathlib.Path.home() / ".cache" / "openpi" / "big_vision" / "paligemma_tokenizer.model",
+    pathlib.Path("/root/.cache/openpi/big_vision/paligemma_tokenizer.model"),
+]
+TOKENIZER_MODEL = str(next((p for p in _TOKENIZER_SEARCH_PATHS if p.exists()), _TOKENIZER_SEARCH_PATHS[0]))
 
-ACTION_HORIZON = 11
-NUM_STEPS = 8
 IMAGE_SIZE = 224
 MAX_TOKEN_LEN = 200
 
 ROBOT_CONFIGS = {
-    "pi05_excavator_v2": {
-        "action_dim": 4,
-        "checkpoint_dir": "/workspace/openpi/checkpoints/excavator_v1_pytorch",
-        "norm_stats": "/workspace/openpi/checkpoints/excavator_v1_pytorch/norm_stats.json",
+    "pi05_so100_encoder": {
+        "action_dim": 6,
+        "action_horizon": 10,
+        "num_denoising_steps": 7,
+        "checkpoint_dir": os.path.expanduser("~/encoder_checkpoint/5000"),
+        "norm_stats": os.path.expanduser("~/encoder_checkpoint/5000/assets/assets/verm11/so-100-encoders/norm_stats.json"),
         "obs_image_keys": [
-            ("observation/image_cab", "base_0_rgb"),
-            ("observation/image_side", "left_wrist_0_rgb"),
+            ("observation/image_scene", "base_0_rgb"),
+            ("observation/image_wrist", "left_wrist_0_rgb"),
         ],
     },
     "pi05_so100": {
         "action_dim": 6,
-        "checkpoint_dir": "/workspace/openpi/checkpoints/runD_qat_pytorch",
-        "norm_stats": "/workspace/openpi/checkpoints/runD_qat_pytorch/assets/verm11/runA/norm_stats.json",
+        "action_horizon": 11,
+        "num_denoising_steps": 8,
+        "checkpoint_dir": os.path.expanduser("~/openpi-actor-labs/checkpoints/runD_qat_pytorch"),
+        "norm_stats": os.path.expanduser("~/openpi-actor-labs/checkpoints/runD_qat_pytorch/assets/verm11/runA/norm_stats.json"),
         "obs_image_keys": [
             ("observation/image_scene", "base_0_rgb"),
             ("observation/image_wrist", "left_wrist_0_rgb"),
+        ],
+    },
+    "pi05_excavator_v2": {
+        "action_dim": 4,
+        "action_horizon": 11,
+        "num_denoising_steps": 8,
+        "checkpoint_dir": os.path.expanduser("~/openpi-actor-labs/checkpoints/excavator_v1_pytorch"),
+        "norm_stats": os.path.expanduser("~/openpi-actor-labs/checkpoints/excavator_v1_pytorch/norm_stats.json"),
+        "obs_image_keys": [
+            ("observation/image_cab", "base_0_rgb"),
+            ("observation/image_side", "left_wrist_0_rgb"),
         ],
     },
 }
@@ -60,7 +87,7 @@ ROBOT_CONFIGS = {
 class ModelConfig:
     pi05: bool = True
     action_dim: int = 6
-    action_horizon: int = ACTION_HORIZON
+    action_horizon: int = 10
     paligemma_variant: str = "gemma_2b_lora"
     action_expert_variant: str = "gemma_300m_lora"
     dtype: str = "bfloat16"
@@ -91,7 +118,7 @@ class QuantileNormalizer:
         return (actions + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
 
 
-def load_model(device, action_dim, checkpoint_dir):
+def load_model(device, action_dim, checkpoint_dir, action_horizon=10):
     import safetensors.torch
     from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
     import openpi.models_pytorch.pi0_pytorch as _pi0
@@ -103,8 +130,8 @@ def load_model(device, action_dim, checkpoint_dir):
         return _orig(target_dtype, device_type)
     _pi0.get_safe_dtype = _patched
 
-    config = ModelConfig(action_dim=action_dim, state_dim=action_dim)
-    log.info("Creating PI0Pytorch model (action_dim=%d)...", action_dim)
+    config = ModelConfig(action_dim=action_dim, state_dim=action_dim, action_horizon=action_horizon)
+    log.info("Creating PI0Pytorch model (action_dim=%d, action_horizon=%d)...", action_dim, action_horizon)
     orig_compile = torch.compile
     torch.compile = lambda fn, **kw: fn
     try:
@@ -165,11 +192,13 @@ def preprocess_image(img_uint8):
 
 class PyTorchPolicy:
     def __init__(self, model, device, normalizer, tokenizer_path, action_dim,
-                 obs_image_keys=None):
+                 action_horizon=10, num_denoising_steps=7, obs_image_keys=None):
         self.model = model
         self.device = device
         self.normalizer = normalizer
         self.action_dim = action_dim
+        self.action_horizon = action_horizon
+        self.num_denoising_steps = num_denoising_steps
         self.obs_image_keys = obs_image_keys or [
             ("observation/image_scene", "base_0_rgb"),
             ("observation/image_wrist", "left_wrist_0_rgb"),
@@ -239,7 +268,7 @@ class PyTorchPolicy:
         observation = _model.Observation.from_dict(obs_dict)
 
         with torch.no_grad():
-            raw_actions = self.model.sample_actions(self.device, observation, num_steps=NUM_STEPS)
+            raw_actions = self.model.sample_actions(self.device, observation, num_steps=self.num_denoising_steps)
 
         actions_np = raw_actions.cpu().numpy()[0, :, :self.action_dim]
         actions_unnorm = self.normalizer.unnormalize_actions(actions_np)
@@ -253,7 +282,7 @@ class PyTorchPolicy:
 
     @property
     def metadata(self):
-        return {"action_dim": self.action_dim, "action_horizon": ACTION_HORIZON, "model": "pi0.5-pytorch"}
+        return {"action_dim": self.action_dim, "action_horizon": self.action_horizon, "model": "pi0.5-pytorch"}
 
 
 async def handler(websocket, policy):
@@ -297,27 +326,52 @@ async def main_async(policy, port):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config-name", default="pi05_excavator_v2",
+    parser = argparse.ArgumentParser(description="PyTorch policy server for PI0.5 on Jetson Thor")
+    parser.add_argument("--config-name", default="pi05_so100_encoder",
                         choices=list(ROBOT_CONFIGS.keys()),
-                        help="Robot config to use (sets ACTION_DIM and default paths)")
+                        help="Robot config to use")
     parser.add_argument("--port", type=int, default=8001)
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Override checkpoint directory")
+    parser.add_argument("--norm-stats", type=str, default=None,
+                        help="Override norm stats path")
     args = parser.parse_args()
 
     robot_cfg = ROBOT_CONFIGS[args.config_name]
     action_dim = robot_cfg["action_dim"]
-    checkpoint_dir = robot_cfg["checkpoint_dir"]
-    norm_stats_path = robot_cfg["norm_stats"]
+    action_horizon = robot_cfg["action_horizon"]
+    num_denoising_steps = robot_cfg["num_denoising_steps"]
+    checkpoint_dir = args.checkpoint or robot_cfg["checkpoint_dir"]
+    norm_stats_path = args.norm_stats or robot_cfg["norm_stats"]
     obs_image_keys = robot_cfg["obs_image_keys"]
-    log.info("Robot config: %s  ACTION_DIM=%d", args.config_name, action_dim)
+
+    log.info("Robot config: %s", args.config_name)
+    log.info("  action_dim=%d, action_horizon=%d, denoise_steps=%d",
+             action_dim, action_horizon, num_denoising_steps)
+    log.info("  checkpoint: %s", checkpoint_dir)
+    log.info("  norm_stats: %s", norm_stats_path)
+    log.info("  tokenizer:  %s", TOKENIZER_MODEL)
+
+    if not pathlib.Path(checkpoint_dir).exists():
+        log.error("Checkpoint dir does not exist: %s", checkpoint_dir)
+        sys.exit(1)
+    if not pathlib.Path(norm_stats_path).exists():
+        log.error("Norm stats file does not exist: %s", norm_stats_path)
+        sys.exit(1)
+    if not pathlib.Path(TOKENIZER_MODEL).exists():
+        log.error("Tokenizer model not found: %s", TOKENIZER_MODEL)
+        sys.exit(1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Using device: %s", device)
 
-    model = load_model(device, action_dim=action_dim, checkpoint_dir=checkpoint_dir)
+    model = load_model(device, action_dim=action_dim, checkpoint_dir=checkpoint_dir,
+                       action_horizon=action_horizon)
     normalizer = QuantileNormalizer(norm_stats_path)
     policy = PyTorchPolicy(model, device, normalizer, TOKENIZER_MODEL,
-                           action_dim=action_dim, obs_image_keys=obs_image_keys)
+                           action_dim=action_dim, action_horizon=action_horizon,
+                           num_denoising_steps=num_denoising_steps,
+                           obs_image_keys=obs_image_keys)
 
     log.info("Warming up...")
     dummy_obs = {

@@ -1,22 +1,25 @@
 """Run the trained SO-100 joystick policy on the physical robot arm.
 
-Connects to a remote GPU policy server via WebSocket, captures camera frames,
+Connects to the Jetson Thor policy server via WebSocket, captures camera frames,
 sends observations, and executes predicted joystick commands on the arm.
 
 Usage:
-    # Start the policy server on RunPod first:
-    #   uv run scripts/serve_policy.py policy:checkpoint --policy.config pi05_so100_lora \
-    #       --policy.dir checkpoints/pi05_so100_lora/run1/4999
+    # Start the policy server on the Jetson first:
+    #   python scripts/serve_pytorch_minimal.py --config-name pi05_so100_encoder --port 8001
 
-    # Then on the Mac (with SSH tunnel to RunPod port 8000):
-    python run_policy.py \
-        --host localhost --port 8000 \
-        --arm-port /dev/tty.usbmodem5A7A0157861 \
-        --scene-cam 1 --wrist-cam 2 \
+    # Then on your laptop (cameras + arm connected here):
+    python examples/so100/run_policy.py \
+        --host <JETSON_IP> --port 8001 \
+        --arm-port /dev/tty.usbmodemXXXXXX \
+        --scene-cam 0 --wrist-cam 1 \
         --prompt "Pick up the bottle and place it on the yellow outlined square."
 
     # Dry run (no arm, prints predicted actions):
-    python run_policy.py --host localhost --port 8000 --dry-run --scene-cam 1 --wrist-cam 2
+    python examples/so100/run_policy.py --host <JETSON_IP> --port 8001 \
+        --dry-run --scene-cam 0 --wrist-cam 1
+
+    # Detect available cameras first:
+    python examples/so100/run_policy.py --detect-cameras
 """
 
 import argparse
@@ -355,15 +358,41 @@ def run(args):
         logger.info("Done. Executed %d steps.", step)
 
 
+def detect_cameras():
+    """Probe camera indices 0-9 and report which ones are available."""
+    logger.info("Detecting available cameras (indices 0-9)...")
+    found = []
+    for i in range(10):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            ret, _ = cap.read()
+            status = "readable" if ret else "opened but no frames"
+            logger.info("  Camera index %d: %dx%d (%s)", i, w, h, status)
+            if ret:
+                found.append(i)
+            cap.release()
+    if not found:
+        logger.warning("No working cameras found!")
+    else:
+        logger.info("Working cameras: %s", found)
+        if len(found) >= 2:
+            logger.info("Suggested: --scene-cam %d --wrist-cam %d", found[0], found[1])
+        elif len(found) == 1:
+            logger.info("Only one camera found. You need two (scene + wrist).")
+    return found
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run SO-100 policy on physical arm")
-    parser.add_argument("--host", type=str, default="localhost",
-                        help="Policy server host (default: localhost via SSH tunnel)")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--arm-port", type=str, default="/dev/tty.usbmodem5A7A0157861",
-                        help="Serial port for the arm")
-    parser.add_argument("--scene-cam", type=int, default=1, help="Scene camera index")
-    parser.add_argument("--wrist-cam", type=int, default=2, help="Wrist camera index")
+    parser.add_argument("--host", type=str, default="192.168.1.88",
+                        help="Policy server host (Jetson Thor IP)")
+    parser.add_argument("--port", type=int, default=8001)
+    parser.add_argument("--arm-port", type=str, default=None,
+                        help="Serial port for the arm (auto-detected if not set)")
+    parser.add_argument("--scene-cam", type=int, default=0, help="Scene camera index")
+    parser.add_argument("--wrist-cam", type=int, default=1, help="Wrist camera index")
     parser.add_argument("--prompt", type=str,
                         default="Pick up the bottle and place it on the yellow outlined square.")
     parser.add_argument("--speed", type=float, default=SPEED, help="Movement speed multiplier")
@@ -372,7 +401,24 @@ def main():
                         help="Number of actions from each prediction to execute (1=no chunking, 6=recommended)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print predicted actions without sending to servos")
+    parser.add_argument("--detect-cameras", action="store_true",
+                        help="Detect available cameras and exit")
     args = parser.parse_args()
+
+    if args.detect_cameras:
+        detect_cameras()
+        return
+
+    if not args.dry_run and args.arm_port is None:
+        import glob
+        candidates = glob.glob("/dev/tty.usbmodem*") + glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")
+        if candidates:
+            args.arm_port = candidates[0]
+            logger.info("Auto-detected arm port: %s", args.arm_port)
+        else:
+            logger.error("No arm port found. Use --arm-port or --dry-run")
+            sys.exit(1)
+
     run(args)
 
 
