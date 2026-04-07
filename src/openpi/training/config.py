@@ -1338,6 +1338,31 @@ _CONFIGS = [
         batch_size=32,
     ),
     TrainConfig(
+        name="pi05_actor_teleop_300",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=4,
+            action_horizon=11,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotExcavatorDataConfig(
+            repo_id="verm11/actor_teleop_300",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=15_000,
+        save_interval=2_500,
+        keep_period=5_000,
+        batch_size=32,
+    ),
+    TrainConfig(
         name="debug_pi05",
         model=pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
         data=FakeDataConfig(),
