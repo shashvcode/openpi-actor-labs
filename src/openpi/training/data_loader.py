@@ -1,5 +1,7 @@
 from collections.abc import Iterator, Sequence
+import json
 import logging
+import math
 import multiprocessing
 import os
 import pathlib
@@ -10,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
+import packaging.version
 import torch
 
 import openpi.models.model as _model
@@ -174,6 +177,74 @@ def _patch_image_transform(dataset: lerobot_dataset.LeRobotDataset, meta: lerobo
     dataset.hf_dataset.set_transform(_ImageDecodingTransform(image_keys))
 
 
+_V21 = packaging.version.parse("v2.1")
+
+
+def _adapt_v3_metadata_to_v2(repo_id: str) -> None:
+    """Pre-download and patch v3.0 dataset metadata to be v2.0-compatible on disk.
+
+    The pinned lerobot (CODEBASE_VERSION v2.1) cannot load v3.0 datasets due to
+    missing fields, renamed format variables, and changed feature dtypes.  Rather
+    than monkey-patching every internal function, we rewrite ``info.json`` on disk
+    *before* ``LeRobotDatasetMetadata`` is constructed so lerobot loads it natively.
+    """
+    from huggingface_hub import snapshot_download
+    from lerobot.common.constants import HF_LEROBOT_HOME
+
+    local_root = HF_LEROBOT_HOME / repo_id
+    info_path = local_root / "meta" / "info.json"
+
+    if not info_path.exists():
+        (local_root / "meta").mkdir(exist_ok=True, parents=True)
+        snapshot_download(
+            repo_id,
+            repo_type="dataset",
+            revision="main",
+            local_dir=str(local_root),
+            allow_patterns="meta/",
+        )
+
+    if not info_path.exists():
+        return
+
+    info = json.loads(info_path.read_text())
+    version = packaging.version.parse(info.get("codebase_version", "v2.0"))
+    if version <= _V21:
+        return
+
+    logging.info("Adapting v3.0 metadata to v2.0 for %s", repo_id)
+
+    info["codebase_version"] = "v2.0"
+
+    chunks_size = info.get("chunks_size", 1000)
+    info.setdefault("chunks_size", chunks_size)
+
+    total_eps = info.get("total_episodes", 0)
+    info.setdefault("total_chunks", math.ceil(total_eps / chunks_size) if chunks_size else 1)
+
+    tasks_path = local_root / "meta" / "tasks.jsonl"
+    if "total_tasks" not in info and tasks_path.exists():
+        info["total_tasks"] = sum(1 for _ in tasks_path.open())
+    info.setdefault("total_tasks", 0)
+
+    total_frames = info.get("total_frames", 0)
+    info.setdefault("splits", {"train": f"0:{total_frames}"})
+
+    info.setdefault("video_path", None)
+
+    dp = info.get("data_path", "")
+    dp = dp.replace("{chunk_index", "{episode_chunk").replace("{file_index", "{episode_index")
+    info["data_path"] = dp
+
+    for ft in info.get("features", {}).values():
+        if ft.get("dtype") == "image_bytes":
+            ft["dtype"] = "image"
+        ft.setdefault("names", [None] * len(ft.get("shape", ())))
+
+    info_path.write_text(json.dumps(info, indent=2))
+    logging.info("Rewrote %s as v2.0-compatible", info_path)
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -212,51 +283,9 @@ def create_torch_dataset(
     except Exception:
         pass
 
-    try:
-        from lerobot.common.datasets import utils as _lerobot_utils
-        from lerobot.common.datasets import lerobot_dataset as _lr_ds_ver
-        _orig_get_safe = getattr(_lerobot_utils, "get_safe_version", None)
-        if _orig_get_safe is not None:
-            def _permissive_get_safe(repo_id, version, *args, **kwargs):
-                try:
-                    return _orig_get_safe(repo_id, version, *args, **kwargs)
-                except Exception:
-                    logging.warning("LeRobot version check failed for %s — bypassing", repo_id)
-                    return "main"
-            _lerobot_utils.get_safe_version = _permissive_get_safe
-            if hasattr(_lr_ds_ver, "get_safe_version"):
-                _lr_ds_ver.get_safe_version = _permissive_get_safe
-            logging.info("Patched LeRobot get_safe_version to allow newer datasets")
-    except Exception:
-        pass
-
-    try:
-        from lerobot.common.datasets import utils as _lerobot_utils
-        from lerobot.common.datasets import lerobot_dataset as _lr_ds_ver
-        _orig_load_ep_stats = getattr(_lerobot_utils, "load_episodes_stats", None)
-        if _orig_load_ep_stats is not None:
-            def _safe_load_ep_stats(*args, **kwargs):
-                try:
-                    return _orig_load_ep_stats(*args, **kwargs)
-                except FileNotFoundError:
-                    logging.warning("episodes_stats.jsonl not found (v3.0 dataset) — returning empty stats")
-                    return {}
-            _lerobot_utils.load_episodes_stats = _safe_load_ep_stats
-            if hasattr(_lr_ds_ver, "load_episodes_stats"):
-                _lr_ds_ver.load_episodes_stats = _safe_load_ep_stats
-    except Exception:
-        pass
+    _adapt_v3_metadata_to_v2(repo_id)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-
-    if "chunks_size" not in dataset_meta.info:
-        total_eps = dataset_meta.info.get("total_episodes", 0)
-        dataset_meta.info["chunks_size"] = max(total_eps, 1000)
-        logging.warning("Injected chunks_size=%d into v3.0 dataset metadata", dataset_meta.info["chunks_size"])
-    if "splits" not in dataset_meta.info:
-        total_frames = dataset_meta.info.get("total_frames", 0)
-        dataset_meta.info["splits"] = {"train": f"0:{total_frames}"}
-        logging.warning("Injected splits into v3.0 dataset metadata")
 
     ds_kwargs = dict(
         repo_id=data_config.repo_id,
