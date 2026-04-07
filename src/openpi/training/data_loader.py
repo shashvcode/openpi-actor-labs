@@ -212,6 +212,21 @@ def create_torch_dataset(
     except Exception:
         pass
 
+    try:
+        from lerobot.common.datasets import utils as _lerobot_utils
+        _orig_get_safe = getattr(_lerobot_utils, "get_safe_version", None)
+        if _orig_get_safe is not None:
+            def _permissive_get_safe(repo_id, version, *args, **kwargs):
+                try:
+                    return _orig_get_safe(repo_id, version, *args, **kwargs)
+                except Exception:
+                    logging.warning("LeRobot version check failed for %s — bypassing", repo_id)
+                    return "main"
+            _lerobot_utils.get_safe_version = _permissive_get_safe
+            logging.info("Patched LeRobot get_safe_version to allow newer datasets")
+    except Exception:
+        pass
+
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
 
     ds_kwargs = dict(
