@@ -283,6 +283,23 @@ def create_torch_dataset(
     except Exception:
         pass
 
+    try:
+        from lerobot.common.datasets import utils as _lerobot_utils
+        from lerobot.common.datasets import lerobot_dataset as _lr_ds_ver
+        _orig_get_safe = getattr(_lerobot_utils, "get_safe_version", None)
+        if _orig_get_safe is not None:
+            def _permissive_get_safe(repo_id, version, *args, **kwargs):
+                try:
+                    return _orig_get_safe(repo_id, version, *args, **kwargs)
+                except Exception:
+                    logging.warning("LeRobot version check failed for %s — using 'main'", repo_id)
+                    return "main"
+            _lerobot_utils.get_safe_version = _permissive_get_safe
+            if hasattr(_lr_ds_ver, "get_safe_version"):
+                _lr_ds_ver.get_safe_version = _permissive_get_safe
+    except Exception:
+        pass
+
     _adapt_v3_metadata_to_v2(repo_id)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
