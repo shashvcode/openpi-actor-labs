@@ -249,6 +249,15 @@ def create_torch_dataset(
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
 
+    if "chunks_size" not in dataset_meta.info:
+        total_eps = dataset_meta.info.get("total_episodes", 0)
+        dataset_meta.info["chunks_size"] = max(total_eps, 1000)
+        logging.warning("Injected chunks_size=%d into v3.0 dataset metadata", dataset_meta.info["chunks_size"])
+    if "splits" not in dataset_meta.info:
+        total_frames = dataset_meta.info.get("total_frames", 0)
+        dataset_meta.info["splits"] = {"train": f"0:{total_frames}"}
+        logging.warning("Injected splits into v3.0 dataset metadata")
+
     ds_kwargs = dict(
         repo_id=data_config.repo_id,
         delta_timestamps={
