@@ -240,7 +240,7 @@ def create_torch_dataset(
                     return _orig_load_ep_stats(*args, **kwargs)
                 except FileNotFoundError:
                     logging.warning("episodes_stats.jsonl not found (v3.0 dataset) — returning empty stats")
-                    return []
+                    return {}
             _lerobot_utils.load_episodes_stats = _safe_load_ep_stats
             if hasattr(_lr_ds_ver, "load_episodes_stats"):
                 _lr_ds_ver.load_episodes_stats = _safe_load_ep_stats
