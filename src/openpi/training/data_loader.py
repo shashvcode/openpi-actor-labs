@@ -230,6 +230,23 @@ def create_torch_dataset(
     except Exception:
         pass
 
+    try:
+        from lerobot.common.datasets import utils as _lerobot_utils
+        from lerobot.common.datasets import lerobot_dataset as _lr_ds_ver
+        _orig_load_ep_stats = getattr(_lerobot_utils, "load_episodes_stats", None)
+        if _orig_load_ep_stats is not None:
+            def _safe_load_ep_stats(*args, **kwargs):
+                try:
+                    return _orig_load_ep_stats(*args, **kwargs)
+                except FileNotFoundError:
+                    logging.warning("episodes_stats.jsonl not found (v3.0 dataset) — returning empty stats")
+                    return []
+            _lerobot_utils.load_episodes_stats = _safe_load_ep_stats
+            if hasattr(_lr_ds_ver, "load_episodes_stats"):
+                _lr_ds_ver.load_episodes_stats = _safe_load_ep_stats
+    except Exception:
+        pass
+
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
 
     ds_kwargs = dict(
