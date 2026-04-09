@@ -1,7 +1,9 @@
 import dataclasses
+import io
 
 import einops
 import numpy as np
+from PIL import Image
 
 from openpi import transforms
 from openpi.models import model as _model
@@ -20,10 +22,17 @@ def make_excavator_example() -> dict:
 
 
 def _parse_image(image) -> np.ndarray:
-    image = np.asarray(image)
+    if isinstance(image, dict) and "bytes" in image:
+        image = Image.open(io.BytesIO(image["bytes"])).convert("RGB")
+    elif isinstance(image, bytes):
+        image = Image.open(io.BytesIO(image)).convert("RGB")
+    if isinstance(image, Image.Image):
+        image = np.asarray(image.convert("RGB"))
+    else:
+        image = np.asarray(image)
     if np.issubdtype(image.dtype, np.floating):
         image = (255 * image).astype(np.uint8)
-    if image.shape[0] == 3:
+    if image.ndim == 3 and image.shape[0] == 3:
         image = einops.rearrange(image, "c h w -> h w c")
     return image
 
