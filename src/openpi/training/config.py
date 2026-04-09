@@ -525,6 +525,43 @@ class LeRobotExcavatorDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotCANExcavatorDataConfig(DataConfigFactory):
+    """Config for CAN-bus excavator (TB20E) data. 8-dim actions, 3 cameras (cab_forward, front_left, front_right)."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image_cab_forward": "observation.images.cab_forward",
+                        "observation/image_front_left": "observation.images.front_left",
+                        "observation/image_front_right": "observation.images.front_right",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[excavator_policy.CANExcavatorInputs()],
+            outputs=[excavator_policy.CANExcavatorOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -1348,6 +1385,34 @@ _CONFIGS = [
         ),
         data=LeRobotExcavatorDataConfig(
             repo_id="verm11/actor_teleop_300",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=15_000,
+        save_interval=2_500,
+        keep_period=5_000,
+        batch_size=32,
+    ),
+    #
+    # CAN-bus excavator (TB20E) configs.
+    #
+    TrainConfig(
+        name="pi05_can_teleop",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=8,
+            action_horizon=11,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotCANExcavatorDataConfig(
+            repo_id="verm11/CANteleop",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
