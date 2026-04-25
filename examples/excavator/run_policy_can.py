@@ -139,17 +139,34 @@ class CameraSource:
                 sys.exit(f"Failed to reach {label} camera at {source}: {exc}")
         else:
             self._url = None
-            self._cap = cv2.VideoCapture(int(source))
+            self._cap = cv2.VideoCapture(int(source), cv2.CAP_V4L2)
             if not self._cap.isOpened():
                 sys.exit(f"Failed to open {label} camera (device index {source})")
+            self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
             self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+            self._cap.set(cv2.CAP_PROP_FPS, 30)
             actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fourcc_int = int(self._cap.get(cv2.CAP_PROP_FOURCC))
+            fourcc_str = "".join(chr((fourcc_int >> (8 * i)) & 0xFF) for i in range(4))
+            warmup_ok = 0
+            for _ in range(15):
+                ok, _ = self._cap.read()
+                if ok:
+                    warmup_ok += 1
+                    if warmup_ok >= 3:
+                        break
+                time.sleep(0.05)
             logger.info(
-                "[cam:%s] local /dev/video%s native %dx%d  rotate_180=%s",
-                label, source, actual_w, actual_h, rotate_180,
+                "[cam:%s] /dev/video%s %dx%d %s rotate_180=%s warmup=%d",
+                label, source, actual_w, actual_h, fourcc_str, rotate_180, warmup_ok,
             )
+            if warmup_ok == 0:
+                logger.warning(
+                    "[cam:%s] /dev/video%s opened but produced no warmup frames; "
+                    "will continue but expect drops.", label, source,
+                )
 
     def grab(self, size: int = MODEL_IMG_SIZE) -> Optional[np.ndarray]:
         if self._is_http:
@@ -481,9 +498,15 @@ def run(args: argparse.Namespace) -> None:
             fl = fl_cam.grab(MODEL_IMG_SIZE)
             fr = fr_cam.grab(MODEL_IMG_SIZE)
             if cab is None or fl is None or fr is None:
-                logger.warning("camera frame dropped, retrying ...")
+                drop_counter = locals().get("drop_counter", 0) + 1
+                if drop_counter == 1 or drop_counter % 30 == 0:
+                    missing = [n for n, x in (("cab", cab), ("fl", fl), ("fr", fr)) if x is None]
+                    logger.warning(
+                        "camera frame dropped (%s) — retry #%d", ",".join(missing), drop_counter,
+                    )
                 time.sleep(0.01)
                 continue
+            drop_counter = 0
 
             if can_reader is not None:
                 state = can_reader.get_state()
