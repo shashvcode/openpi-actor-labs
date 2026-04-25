@@ -1427,6 +1427,36 @@ _CONFIGS = [
         keep_period=5_000,
         batch_size=32,
     ),
+    #
+    # Full fine-tune variant for the CAN-bus excavator. Same data layout as
+    # pi05_can_teleop (8-dim actions, 3 cameras), but uses non-LoRA paligemma /
+    # action-expert variants — matches the architecture of the published
+    # checkpoint `verm11/pi05-canteleop-fullft`.
+    #
+    # Used by `examples/excavator/run_policy_can.py` (Jetson client) ->
+    # `scripts/serve_policy.py policy:checkpoint --policy.config pi05_canteleop_fullft`
+    # on a RunPod GPU.
+    #
+    TrainConfig(
+        name="pi05_canteleop_fullft",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=8,
+            action_horizon=11,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LeRobotCANExcavatorDataConfig(
+            repo_id="verm11/CANteleop",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        ema_decay=None,
+        num_train_steps=15_000,
+        save_interval=2_500,
+        keep_period=5_000,
+        batch_size=32,
+    ),
     TrainConfig(
         name="debug_pi05",
         model=pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
