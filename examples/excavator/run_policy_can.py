@@ -417,8 +417,8 @@ def run(args: argparse.Namespace) -> None:
     fl_source = args.front_left_cam_url if args.front_left_cam_url else args.front_left_cam
     fr_source = args.front_right_cam_url if args.front_right_cam_url else args.front_right_cam
     cab_cam = CameraSource(cab_source, "cab_forward", rotate_180=args.cab_rotate_180)
-    fl_cam  = CameraSource(fl_source,  "front_left",  rotate_180=False)
-    fr_cam  = CameraSource(fr_source,  "front_right", rotate_180=False)
+    fl_cam  = CameraSource(fl_source,  "front_left",  rotate_180=args.front_left_rotate_180)
+    fr_cam  = CameraSource(fr_source,  "front_right", rotate_180=args.front_right_rotate_180)
 
     can_reader: Optional[CANStateReader] = None
     if not args.no_can:
@@ -590,6 +590,10 @@ def main() -> None:
     g.add_argument("--front-right-cam-url", default=None, help="HTTP URL for front_right.")
     g.add_argument("--cab-rotate-180", action="store_true",
                    help="Rotate the cab camera 180 deg (matches existing Jetson rig).")
+    g.add_argument("--front-left-rotate-180", action="store_true",
+                   help="Rotate the front_left camera 180 deg (use if mounted inverted).")
+    g.add_argument("--front-right-rotate-180", action="store_true",
+                   help="Rotate the front_right camera 180 deg (use if mounted inverted).")
 
     g = p.add_argument_group("CAN state input")
     g.add_argument("--can-channel", default=DEFAULT_CHANNEL,
