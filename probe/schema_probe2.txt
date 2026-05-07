@@ -1,0 +1,25 @@
+warning: The `tool.uv.dev-dependencies` field (used in `packages/openpi-client/pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
+
+--- round 0 ---
+  obs keys: ['observation/state', 'prompt']
+  server reports missing key: 'observation/image/front_cam'
+
+--- round 1 ---
+  obs keys: ['observation/image/front_cam', 'observation/state', 'prompt']
+  server reports missing key: 'observation/image/arm_cam'
+
+--- round 2 ---
+  obs keys: ['observation/image/arm_cam', 'observation/image/front_cam', 'observation/state', 'prompt']
+  server reports missing key: 'observation/image/side_cam'
+
+--- round 3 ---
+  obs keys: ['observation/image/arm_cam', 'observation/image/front_cam', 'observation/image/side_cam', 'observation/state', 'prompt']
+  OK. action keys: ['actions', 'policy_timing', 'server_timing']
+  actions shape=(16, 4) dtype=float64 min=-0.009 max=0.017
+
+>>> Discovered obs keys (in order):
+    - observation/image/front_cam
+    - observation/image/arm_cam
+    - observation/image/side_cam
+    + observation/state (shape=(4,), float32)
+    + prompt (str)

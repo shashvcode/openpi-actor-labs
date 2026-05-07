@@ -1,0 +1,65 @@
+warning: The `tool.uv.dev-dependencies` field (used in `packages/openpi-client/pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
+
+=== (0) empty obs ===
+  sending keys: ['prompt']
+  ERROR (last lines):
+        action = self._policy.infer(obs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+      File "/workspace/pi-base-paligemma/src/openpi/policies/policy.py", line 71, in infer
+        inputs = self._input_transform(inputs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      File "/workspace/pi-base-paligemma/src/openpi/transforms.py", line 70, in __call__
+        data = transform(data)
+               ^^^^^^^^^^^^^^^
+      File "/workspace/pi-base-paligemma/src/openpi/policies/excavator_dirt_scoop_policy.py", line 73, in __call__
+        base_image = _parse_image(data["observation/image/front_cam"])
+                                  ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    KeyError: 'observation/image/front_cam'
+
+=== (1) excavator 2-cam: image_cab + image_side, state=4 ===
+  sending keys: ['observation/image_cab', 'observation/image_side', 'observation/state', 'prompt']
+  ERROR (last lines):
+        action = self._policy.infer(obs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+      File "/workspace/pi-base-paligemma/src/openpi/policies/policy.py", line 71, in infer
+        inputs = self._input_transform(inputs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      File "/workspace/pi-base-paligemma/src/openpi/transforms.py", line 70, in __call__
+        data = transform(data)
+               ^^^^^^^^^^^^^^^
+      File "/workspace/pi-base-paligemma/src/openpi/policies/excavator_dirt_scoop_policy.py", line 73, in __call__
+        base_image = _parse_image(data["observation/image/front_cam"])
+                                  ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    KeyError: 'observation/image/front_cam'
+
+=== (2) 3-cam custom: image_arm + image_top + image_side, state=4 ===
+  sending keys: ['observation/image_arm', 'observation/image_side', 'observation/image_top', 'observation/state', 'prompt']
+  ERROR (last lines):
+        action = self._policy.infer(obs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+      File "/workspace/pi-base-paligemma/src/openpi/policies/policy.py", line 71, in infer
+        inputs = self._input_transform(inputs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      File "/workspace/pi-base-paligemma/src/openpi/transforms.py", line 70, in __call__
+        data = transform(data)
+               ^^^^^^^^^^^^^^^
+      File "/workspace/pi-base-paligemma/src/openpi/policies/excavator_dirt_scoop_policy.py", line 73, in __call__
+        base_image = _parse_image(data["observation/image/front_cam"])
+                                  ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    KeyError: 'observation/image/front_cam'
+
+=== (3) CAN 3-cam: cab_forward + front_left + front_right, state=4 ===
+  sending keys: ['observation/image_cab_forward', 'observation/image_front_left', 'observation/image_front_right', 'observation/state', 'prompt']
+  ERROR (last lines):
+        action = self._policy.infer(obs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+      File "/workspace/pi-base-paligemma/src/openpi/policies/policy.py", line 71, in infer
+        inputs = self._input_transform(inputs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      File "/workspace/pi-base-paligemma/src/openpi/transforms.py", line 70, in __call__
+        data = transform(data)
+               ^^^^^^^^^^^^^^^
+      File "/workspace/pi-base-paligemma/src/openpi/policies/excavator_dirt_scoop_policy.py", line 73, in __call__
+        base_image = _parse_image(data["observation/image/front_cam"])
+                                  ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    KeyError: 'observation/image/front_cam'

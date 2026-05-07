@@ -1,0 +1,12 @@
+warning: The `tool.uv.dev-dependencies` field (used in `packages/openpi-client/pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
+Downloading cpython-3.11.15-linux-aarch64-gnu (download) (30.2MiB)
+ Downloaded cpython-3.11.15-linux-aarch64-gnu (download)
+Downloading numpy (13.6MiB)
+ Downloaded numpy
+Installed 3 packages in 20ms
+Connecting to wss://rxz3mb39eex3qv-8000.proxy.runpod.net ...
+
+=== Metadata (raw JSON-able view) ===
+{}
+
+=== Flattened summary ===
