@@ -1,11 +1,12 @@
 """Action interpolator: model 8-dim outputs -> TB20E joystick commands.
 
 Pipeline applied to each axis, in order:
-    1. invert     (negate if configured)
-    2. gain       (multiplicative scale)
-    3. deadzone   (set to zero if |value| < deadzone)
-    4. clip       (clip to [-1, +1])
-    5. slew limit (cap step-to-step delta; default = unbounded passthrough)
+    1. EMA low-pass    (smooth model jitter; see docstring on AxisConfig.ema_alpha)
+    2. invert          (negate if configured)
+    3. gain            (multiplicative scale)
+    4. deadzone        (set to zero if |value| < deadzone)
+    5. clip            (clip to [-1, +1])
+    6. slew limit      (cap step-to-step delta; default = unbounded passthrough)
 
 Then 8 axes -> 4 commandable axes via the demux that matches the existing
 Jetson executor: lx -> body, ly -> arm, rx -> bucket, ry -> boom.
@@ -48,6 +49,15 @@ DROPPED_INDICES = (4, 5, 6, 7)
 class AxisConfig:
     """Per-axis transform applied before slew limiting.
 
+    ema_alpha : one-pole IIR low-pass on the RAW model output. Applied first,
+                so it smooths the model's jitter before any other transform.
+                ``y[t] = alpha*x[t] + (1-alpha)*y[t-1]``.
+                  alpha=1.0 -> no smoothing (passthrough)
+                  alpha=0.5 -> mild
+                  alpha=0.2 -> ~1.6 Hz cutoff at 50 Hz tick rate
+                  alpha=0.1 -> ~0.8 Hz cutoff at 50 Hz tick rate
+                  alpha=0.05 -> ~0.4 Hz cutoff (very heavy)
+                None or 1.0 = passthrough.
     gain     : multiplicative scale on the model output.
     invert   : negate the value (useful when joystick polarity in training
                disagrees with the bridge convention).
@@ -55,6 +65,7 @@ class AxisConfig:
     slew_per_step : maximum allowed |delta| between consecutive 50 Hz steps.
                     None = unbounded (pure passthrough).
     """
+    ema_alpha: Optional[float] = None
     gain: float = 1.0
     invert: bool = False
     deadzone: float = 0.0
@@ -93,14 +104,18 @@ class ActionInterpolator:
     def __init__(self, config: Optional[InterpolatorConfig] = None):
         self.cfg = config or InterpolatorConfig()
         self._last = np.zeros(CAN_ACTION_DIM, dtype=np.float32)
+        self._ema = np.zeros(CAN_ACTION_DIM, dtype=np.float32)
+        self._ema_initialized = np.zeros(CAN_ACTION_DIM, dtype=bool)
         self._warned_dropped = False
 
     def reset(self) -> None:
         """Forget the previous output (next slew step starts from 0)."""
         self._last[:] = 0.0
+        self._ema[:] = 0.0
+        self._ema_initialized[:] = False
 
     def process(self, action_8: np.ndarray) -> np.ndarray:
-        """Apply per-axis transforms + slew limit. Returns float32[8].
+        """Apply EMA smoothing + per-axis transforms + slew limit. Returns float32[8].
 
         The output is the value that should be SENT to the bridge for this
         timestep. The full 8 dims are returned for logging/inspection;
@@ -115,12 +130,26 @@ class ActionInterpolator:
 
         for i, axis_cfg in enumerate(cfgs):
             v = float(a[i])
+
+            # 1. EMA low-pass on the raw model value (smooth high-freq jitter).
+            if axis_cfg.ema_alpha is not None and 0.0 < axis_cfg.ema_alpha < 1.0:
+                alpha = float(axis_cfg.ema_alpha)
+                if not self._ema_initialized[i]:
+                    self._ema[i] = v
+                    self._ema_initialized[i] = True
+                else:
+                    self._ema[i] = alpha * v + (1.0 - alpha) * float(self._ema[i])
+                v = float(self._ema[i])
+
+            # 2-5. invert / gain / deadzone / clip
             if axis_cfg.invert:
                 v = -v
             v *= axis_cfg.gain
             if axis_cfg.deadzone > 0.0 and abs(v) < axis_cfg.deadzone:
                 v = 0.0
             v = max(-1.0, min(1.0, v))
+
+            # 6. slew limit
             if axis_cfg.slew_per_step is not None:
                 cap = float(axis_cfg.slew_per_step)
                 prev = float(self._last[i])

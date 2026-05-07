@@ -169,3 +169,27 @@ cython_debug/
 
 so100_merged/
 actor-pi-keys.json
+
+# Excavator-inference local artifacts (camera dumps, calibration caches, traj exports).
+# These are produced by run_policy_can.py / diagnostic scripts and should never be pushed.
+preflight_frames/
+preflight_cams/
+model_inputs_now/
+model_inputs_raw/
+cam_snapshots/
+examples/excavator/cam_snaps/
+calibration_data/
+calibration_data_fresh/
+onnx_export/
+*.npz
+pi-config.yaml
+
+# Loose camera snapshot files dropped by ad-hoc diagnostic scripts.
+cam_*_check.jpg
+cam_*_now.jpg
+scene_snapshot.jpg
+wrist_snapshot.jpg
+src/cam*_check.jpg
+src/scene_snapshot.jpg
+src/wrist_snapshot.jpg
+_verify_obs_now.py

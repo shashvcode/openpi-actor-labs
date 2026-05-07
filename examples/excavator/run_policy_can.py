@@ -399,20 +399,29 @@ def build_interp_config(args: argparse.Namespace) -> InterpolatorConfig:
     def _slew(v: Optional[float]) -> Optional[float]:
         return None if v is None or v < 0 else float(v)
 
+    def _ema(v: Optional[float]) -> Optional[float]:
+        if v is None or v <= 0.0 or v >= 1.0:
+            return None
+        return float(v)
+
     return InterpolatorConfig(
         left_stick_x=AxisConfig(
+            ema_alpha=_ema(args.smooth_lx),
             gain=args.gain_lx, invert=args.invert_lx,
             deadzone=args.deadzone_lx, slew_per_step=_slew(args.slew_lx),
         ),
         left_stick_y=AxisConfig(
+            ema_alpha=_ema(args.smooth_ly),
             gain=args.gain_ly, invert=args.invert_ly,
             deadzone=args.deadzone_ly, slew_per_step=_slew(args.slew_ly),
         ),
         right_stick_x=AxisConfig(
+            ema_alpha=_ema(args.smooth_rx),
             gain=args.gain_rx, invert=args.invert_rx,
             deadzone=args.deadzone_rx, slew_per_step=_slew(args.slew_rx),
         ),
         right_stick_y=AxisConfig(
+            ema_alpha=_ema(args.smooth_ry),
             gain=args.gain_ry, invert=args.invert_ry,
             deadzone=args.deadzone_ry, slew_per_step=_slew(args.slew_ry),
         ),
@@ -523,6 +532,9 @@ def run(args: argparse.Namespace) -> None:
                 "observation/image_cab_forward":  cab,
                 "observation/image_front_left":   fl,
                 "observation/image_front_right":  fr,
+                "observation/image/cab_forward":  cab,
+                "observation/image/front_left":   fl,
+                "observation/image/front_right":  fr,
                 "observation/state":              state.astype(np.float32),
                 "prompt":                         args.prompt,
             }
@@ -538,6 +550,17 @@ def run(args: argparse.Namespace) -> None:
                 )
                 continue
 
+            voted_stage = result.get("voted_stage")
+            voted_label = result.get("voted_stage_label")
+            raw_label   = result.get("raw_stage_label")
+            cycles      = result.get("cycle_count")
+            cycle_done  = bool(result.get("cycle_complete", False))
+            if cycle_done:
+                logger.info(
+                    "*** CYCLE COMPLETE *** total cycles=%s  stage=%s",
+                    cycles, voted_label,
+                )
+
             for i in range(len(actions)):
                 if shutdown or kb.quit_requested or kb.estopped:
                     break
@@ -549,9 +572,16 @@ def run(args: argparse.Namespace) -> None:
                     commander.set_targets(**cmd)
 
                 if args.verbose or i == 0:
+                    if voted_label is not None:
+                        stage_str = (
+                            f" stage={voted_stage}:{voted_label[:14]:<14s}"
+                            f" cyc={cycles if cycles is not None else '-'}"
+                        )
+                    else:
+                        stage_str = ""
                     sys.stdout.write(
                         f"\rstep {step:6d} chunk {i+1:2d}/{len(actions):2d} "
-                        f"infer {infer_ms:5.0f}ms | "
+                        f"infer {infer_ms:5.0f}ms |{stage_str} | "
                         f"lx={processed[0]:+.2f} ly={processed[1]:+.2f} "
                         f"rx={processed[2]:+.2f} ry={processed[3]:+.2f} | "
                         f"lt={processed[4]:+.2f} rt={processed[5]:+.2f} "
@@ -642,6 +672,11 @@ def main() -> None:
 
     g = p.add_argument_group("Per-axis interpolator (defaults: pure passthrough)")
     for axis in ("lx", "ly", "rx", "ry"):
+        g.add_argument(f"--smooth-{axis}", type=float, default=0.0,
+                       help=(f"EMA low-pass alpha for {axis} (0.0 = off; 0.2 ~= 1.6Hz "
+                             f"cutoff at 50Hz; 0.1 ~= 0.8Hz; 0.05 ~= 0.4Hz). "
+                             f"Smooths model jitter without adding latency or "
+                             f"changing magnitude. Recommended: 0.10-0.20."))
         g.add_argument(f"--gain-{axis}", type=float, default=1.0,
                        help=f"Gain for {axis} axis (default 1.0).")
         g.add_argument(f"--invert-{axis}", type=lambda x: bool(int(x)), default=False,
