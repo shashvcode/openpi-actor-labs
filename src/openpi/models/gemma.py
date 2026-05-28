@@ -146,7 +146,7 @@ class Embedder(nn.Module):
         )
 
     def encode(self, x):
-        x = self.input_embedding_table[(x,)]
+        x = jnp.asarray(self.input_embedding_table)[x]
         x *= jnp.sqrt(self.embed_dim).astype(x.dtype)
         return x
 

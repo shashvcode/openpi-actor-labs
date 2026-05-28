@@ -104,7 +104,10 @@ class GemmaRMSNorm(nn.Module):
         return normed_inputs.to(dtype), gate.to(dtype)
 
     def extra_repr(self):
-        repr_str = f"{tuple(self.weight.shape)}, eps={self.eps}"
+        if hasattr(self, "weight"):
+            repr_str = f"{tuple(self.weight.shape)}, eps={self.eps}"
+        else:
+            repr_str = f"dim={self.dim}, eps={self.eps}"
         if self.dense is not None:
             repr_str += f", adaptive=True, cond_dim={self.cond_dim}"
         return repr_str
